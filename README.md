@@ -1,0 +1,60 @@
+# heroku-scripts
+
+A small bash CLI that wraps the [Heroku CLI](https://devcenter.heroku.com/articles/heroku-cli)
+to run commands against every app in a pipeline stage.
+
+Replaces the older Elixir version of this tool.
+
+## Requirements
+
+- macOS or Linux
+- `bash` (any version that ships with the OS is fine)
+- The `heroku` CLI, installed and authenticated (`heroku login`)
+
+## Install
+
+Drop the script somewhere on your `$PATH`:
+
+```sh
+git clone https://github.com/defactosoftware/heroku-scripts.git
+ln -s "$(pwd)/heroku-scripts/bin/heroku-scripts" /usr/local/bin/heroku-scripts
+```
+
+Or just run `bin/heroku-scripts` directly from a clone.
+
+## Usage
+
+```sh
+heroku-scripts apps <pipeline> <stage>
+heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>"
+heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
+heroku-scripts promote <app> <to-team> <pipeline>
+```
+
+Run `heroku-scripts help` for the full command list.
+
+### Examples
+
+List every app in the `staging` stage of the `my-pipe` pipeline:
+
+```sh
+heroku-scripts apps my-pipe staging
+```
+
+Set a config var on every staging app:
+
+```sh
+heroku-scripts pipeline-cmd my-pipe staging "config:set EMAIL_SENDER=noreply@example.com"
+```
+
+Run a mix task on every production app, four at a time:
+
+```sh
+heroku-scripts pipeline-task my-pipe production GiveRaiseToPeople --concurrency=4
+```
+
+Move an app and its `-staging` sibling to another team and pipeline:
+
+```sh
+heroku-scripts promote my-app defacto detroit
+```
