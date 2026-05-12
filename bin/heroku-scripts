@@ -21,6 +21,11 @@ Commands:
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
       <pipeline>/<stage>. Defaults to 3 concurrent runs.
 
+  promote <app> <to-team> <pipeline>
+      Resize dynos to standard-1x, transfer <app> and <app>-staging
+      to <to-team>, and add them to <pipeline> under production /
+      staging respectively.
+
   help, --help, -h
       Show this help.
 
@@ -123,6 +128,29 @@ cmd_pipeline_task() {
     | xargs -P "$concurrency" -I {} heroku run -a {} mix "$task"
 }
 
+cmd_promote() {
+  if [[ $# -ne 3 ]]; then
+    echo "Usage: $SCRIPT_NAME promote <app> <to-team> <pipeline>" >&2
+    exit 1
+  fi
+  local app="$1" to_team="$2" pipeline="$3"
+  local staging="${app}-staging"
+
+  echo "Promoting $staging and $app ->"
+
+  echo "1. upgrading dynos to standard-1x..."
+  heroku_for_app "$staging" "dyno:resize standard-1x"
+  heroku_for_app "$app" "dyno:resize standard-1x"
+
+  echo "2. transferring ownership to $to_team..."
+  heroku_for_app "$staging" "apps:transfer $to_team"
+  heroku_for_app "$app" "apps:transfer $to_team"
+
+  echo "3. adding to pipeline $pipeline..."
+  heroku_for_app "$staging" "pipelines:add $pipeline -s staging"
+  heroku_for_app "$app" "pipelines:add $pipeline -s production"
+}
+
 main() {
   if [[ $# -eq 0 ]]; then
     usage
@@ -141,6 +169,9 @@ main() {
       ;;
     pipeline-task)
       cmd_pipeline_task "$@"
+      ;;
+    promote)
+      cmd_promote "$@"
       ;;
     help|--help|-h)
       usage
