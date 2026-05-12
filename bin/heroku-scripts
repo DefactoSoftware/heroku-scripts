@@ -95,7 +95,9 @@ cmd_pipeline_cmd() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  # Interpolate $tmpdir into the trap *now*, not at fire time — by the time
+  # the EXIT trap runs, this function has returned and the local is gone.
+  trap "rm -rf '$tmpdir'" EXIT
 
   echo "appname;output"
 
@@ -109,7 +111,10 @@ cmd_pipeline_cmd() {
       output="$(heroku_for_app "$app" "$command")"
       printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
     ) &
-    ((in_flight++))
+    # Pre-increment so the expression value (and thus exit status) is the
+    # new value — post-increment would return 0 on the first iteration and
+    # trip `set -e`.
+    (( ++in_flight ))
     if (( in_flight >= concurrency )); then
       wait
       in_flight=0
