@@ -10,11 +10,34 @@ usage() {
 Usage: $SCRIPT_NAME <command> [args...]
 
 Commands:
+  apps <pipeline> <stage>
+      List apps in <pipeline>/<stage>, one per line.
+
   help, --help, -h
       Show this help.
 
 Requires the \`heroku\` CLI to be installed and authenticated.
 EOF
+}
+
+# Lists apps in <pipeline>/<stage>, one per line, on stdout.
+#
+# Parses `heroku pipelines:info <pipeline>` output, which lists apps as rows of
+# `<app-name>  <stage>`. NO_COLOR=1 plus an ANSI strip keeps colorized output
+# from being mistaken for app names.
+apps_in_stage() {
+  local pipeline="$1" stage="$2"
+  NO_COLOR=1 heroku pipelines:info "$pipeline" \
+    | sed -E $'s/\x1b\\[[0-9;]*m//g' \
+    | awk -v stage="$stage" 'NF >= 2 && $NF == stage { print $1 }'
+}
+
+cmd_apps() {
+  if [[ $# -ne 2 ]]; then
+    echo "Usage: $SCRIPT_NAME apps <pipeline> <stage>" >&2
+    exit 1
+  fi
+  apps_in_stage "$1" "$2"
 }
 
 main() {
@@ -27,6 +50,9 @@ main() {
   shift
 
   case "$cmd" in
+    apps)
+      cmd_apps "$@"
+      ;;
     help|--help|-h)
       usage
       ;;
