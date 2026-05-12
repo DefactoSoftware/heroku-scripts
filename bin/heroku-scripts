@@ -13,9 +13,9 @@ Commands:
   apps <pipeline> <stage>
       List apps in <pipeline>/<stage>, one per line.
 
-  pipeline-cmd <pipeline> <stage> "<heroku command>"
+  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N]
       Run the given heroku command against every app in <pipeline>/<stage>,
-      in parallel. Emits CSV-style output: \`<app>;<output>\`.
+      in chunks of N (default 3). Emits CSV-style output: \`<app>;<output>\`.
 
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
@@ -70,11 +70,21 @@ heroku_for_app() {
 }
 
 cmd_pipeline_cmd() {
-  if [[ $# -ne 3 ]]; then
-    echo "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\"" >&2
+  if [[ $# -lt 3 ]]; then
+    echo "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N]" >&2
     exit 1
   fi
   local pipeline="$1" stage="$2" command="$3"
+  shift 3
+
+  local concurrency=3
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --concurrency=*) concurrency="${1#*=}";;
+      *) echo "Unknown option: $1" >&2; exit 1;;
+    esac
+    shift
+  done
 
   local apps
   apps="$(apps_in_stage "$pipeline" "$stage")"
@@ -88,12 +98,22 @@ cmd_pipeline_cmd() {
   trap 'rm -rf "$tmpdir"' EXIT
 
   echo "appname;output"
+
+  # Process apps in chunks of $concurrency. Waiting for each chunk to drain
+  # before starting the next caps resource use; running every app in parallel
+  # has swamped laptops on large pipelines.
+  local in_flight=0
   while IFS= read -r app; do
     [[ -z "$app" ]] && continue
     (
       output="$(heroku_for_app "$app" "$command")"
       printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
     ) &
+    ((in_flight++))
+    if (( in_flight >= concurrency )); then
+      wait
+      in_flight=0
+    fi
   done <<< "$apps"
   wait
 
