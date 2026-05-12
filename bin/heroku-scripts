@@ -108,6 +108,11 @@ cmd_pipeline_cmd() {
   while IFS= read -r app; do
     [[ -z "$app" ]] && continue
     (
+      # The subshell inherits `set -e`. We deliberately turn it off here so a
+      # non-zero exit from heroku (e.g. pg:psql against an app without a DB)
+      # is captured into the CSV output column rather than killing the
+      # subshell before it can write the file.
+      set +e
       output="$(heroku_for_app "$app" "$command")"
       printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
     ) &
@@ -116,13 +121,15 @@ cmd_pipeline_cmd() {
     # trip `set -e`.
     (( ++in_flight ))
     if (( in_flight >= concurrency )); then
-      wait
+      wait || true
       in_flight=0
     fi
   done <<< "$apps"
-  wait
+  wait || true
 
-  cat "$tmpdir"/*
+  # `find -exec cat` is a no-op when no files matched, which is safer than
+  # `cat $tmpdir/*` (would fail on an empty tmpdir).
+  find "$tmpdir" -type f -exec cat {} +
 }
 
 cmd_pipeline_task() {
