@@ -17,6 +17,10 @@ Commands:
       Run the given heroku command against every app in <pipeline>/<stage>,
       in parallel. Emits CSV-style output: \`<app>;<output>\`.
 
+  pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
+      Run \`mix <MixTask>\` via \`heroku run\` against every app in
+      <pipeline>/<stage>. Defaults to 3 concurrent runs.
+
   help, --help, -h
       Show this help.
 
@@ -91,6 +95,34 @@ cmd_pipeline_cmd() {
   cat "$tmpdir"/*
 }
 
+cmd_pipeline_task() {
+  if [[ $# -lt 3 ]]; then
+    echo "Usage: $SCRIPT_NAME pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]" >&2
+    exit 1
+  fi
+  local pipeline="$1" stage="$2" task="$3"
+  shift 3
+
+  local concurrency=3
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --concurrency=*) concurrency="${1#*=}";;
+      *) echo "Unknown option: $1" >&2; exit 1;;
+    esac
+    shift
+  done
+
+  local apps
+  apps="$(apps_in_stage "$pipeline" "$stage")"
+  if [[ -z "$apps" ]]; then
+    echo "No apps found in $pipeline/$stage" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$apps" \
+    | xargs -P "$concurrency" -I {} heroku run -a {} mix "$task"
+}
+
 main() {
   if [[ $# -eq 0 ]]; then
     usage
@@ -106,6 +138,9 @@ main() {
       ;;
     pipeline-cmd)
       cmd_pipeline_cmd "$@"
+      ;;
+    pipeline-task)
+      cmd_pipeline_task "$@"
       ;;
     help|--help|-h)
       usage
