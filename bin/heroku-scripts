@@ -104,8 +104,14 @@ cmd_pipeline_cmd() {
   # Process apps in chunks of $concurrency. Waiting for each chunk to drain
   # before starting the next caps resource use; running every app in parallel
   # has swamped laptops on large pipelines.
+  #
+  # The app list is fed in on FD 3 (not stdin) and each backgrounded subshell
+  # has its stdin redirected to /dev/null. Without these two redirections,
+  # heroku/psql in the subshell will happily read from the loop's heredoc
+  # and consume the lines that the next `read` was supposed to see — apps
+  # get skipped and their names get fed to heroku as stray positional args.
   local in_flight=0
-  while IFS= read -r app; do
+  while IFS= read -r app <&3; do
     [[ -z "$app" ]] && continue
     (
       # The subshell inherits `set -e`. We deliberately turn it off here so a
@@ -115,7 +121,7 @@ cmd_pipeline_cmd() {
       set +e
       output="$(heroku_for_app "$app" "$command")"
       printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
-    ) &
+    ) </dev/null &
     # Pre-increment so the expression value (and thus exit status) is the
     # new value — post-increment would return 0 on the first iteration and
     # trip `set -e`.
@@ -124,7 +130,7 @@ cmd_pipeline_cmd() {
       wait || true
       in_flight=0
     fi
-  done <<< "$apps"
+  done 3<<< "$apps"
   wait || true
 
   # `find -exec cat` is a no-op when no files matched, which is safer than
