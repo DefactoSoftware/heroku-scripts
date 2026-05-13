@@ -33,14 +33,24 @@ Requires the \`heroku\` CLI to be installed and authenticated.
 EOF
 }
 
+# Strips ambient noise the heroku CLI prints around every invocation: the
+# "heroku update available" banner and pg:psql's "--> Connecting to ..." line.
+# `|| true` keeps grep's "no matches" exit from tripping `set -e`.
+strip_heroku_noise() {
+  grep -vE '^[[:space:]]*›[[:space:]]+Warning: heroku update available' \
+    | grep -vE '^[[:space:]]*-->[[:space:]]+Connecting to postgresql-' \
+    || true
+}
+
 # Lists apps in <pipeline>/<stage>, one per line, on stdout.
 #
 # Parses `heroku pipelines:info <pipeline>` output, which lists apps as rows of
 # `<app-name>  <stage>`. NO_COLOR=1 plus an ANSI strip keeps colorized output
-# from being mistaken for app names.
+# from being mistaken for app names. heroku's stderr is filtered through
+# strip_heroku_noise so the update banner doesn't bleed onto the terminal.
 apps_in_stage() {
   local pipeline="$1" stage="$2"
-  NO_COLOR=1 heroku pipelines:info "$pipeline" \
+  NO_COLOR=1 heroku pipelines:info "$pipeline" 2> >(strip_heroku_noise >&2) \
     | sed -E $'s/\x1b\\[[0-9;]*m//g' \
     | awk -v stage="$stage" 'NF >= 2 && $NF == stage { print $1 }'
 }
@@ -119,7 +129,7 @@ cmd_pipeline_cmd() {
       # is captured into the CSV output column rather than killing the
       # subshell before it can write the file.
       set +e
-      output="$(heroku_for_app "$app" "$command")"
+      output="$(heroku_for_app "$app" "$command" | strip_heroku_noise)"
       printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
     ) </dev/null &
     # Pre-increment so the expression value (and thus exit status) is the
@@ -177,16 +187,16 @@ cmd_promote() {
   echo "Promoting $staging and $app ->"
 
   echo "1. upgrading dynos to standard-1x..."
-  heroku_for_app "$staging" "dyno:resize standard-1x"
-  heroku_for_app "$app" "dyno:resize standard-1x"
+  heroku_for_app "$staging" "dyno:resize standard-1x" | strip_heroku_noise
+  heroku_for_app "$app" "dyno:resize standard-1x" | strip_heroku_noise
 
   echo "2. transferring ownership to $to_team..."
-  heroku_for_app "$staging" "apps:transfer $to_team"
-  heroku_for_app "$app" "apps:transfer $to_team"
+  heroku_for_app "$staging" "apps:transfer $to_team" | strip_heroku_noise
+  heroku_for_app "$app" "apps:transfer $to_team" | strip_heroku_noise
 
   echo "3. adding to pipeline $pipeline..."
-  heroku_for_app "$staging" "pipelines:add $pipeline -s staging"
-  heroku_for_app "$app" "pipelines:add $pipeline -s production"
+  heroku_for_app "$staging" "pipelines:add $pipeline -s staging" | strip_heroku_noise
+  heroku_for_app "$app" "pipelines:add $pipeline -s production" | strip_heroku_noise
 }
 
 main() {
