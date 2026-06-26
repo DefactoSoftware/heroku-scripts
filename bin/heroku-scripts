@@ -222,8 +222,18 @@ cmd_pipeline_task() {
     exit 1
   fi
 
+  # Best-effort, like pipeline-cmd: a single app's failure is reported with its
+  # name and does not abort the whole run. Without the wrapping `sh -c ... ||`,
+  # one failing `heroku run` would make xargs exit non-zero and, under
+  # `set -e`, kill the command before the remaining apps were reported. Output
+  # still interleaves across concurrent runs.
+  # shellcheck disable=SC2016  # $1/$2 are expanded by the inner sh, not now
   printf '%s\n' "$apps" \
-    | xargs -P "$concurrency" -I {} heroku run -a {} mix "$task"
+    | xargs -P "$concurrency" -I {} sh -c '
+        if ! heroku run -a "$1" mix "$2"; then
+          echo "pipeline-task: $1 failed (mix $2)" >&2
+        fi
+      ' _ {} "$task"
 }
 
 cmd_promote() {
