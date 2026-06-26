@@ -15,7 +15,11 @@ Commands:
 
   pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N]
       Run the given heroku command against every app in <pipeline>/<stage>,
-      in chunks of N (default 3). Emits CSV-style output: \`<app>;<output>\`.
+      in chunks of N (default 3). Prints a header line \`appname;output\`
+      then one \`<app>;<output>\` record per app. The output field is the
+      app's raw combined heroku output and may contain newlines and
+      semicolons, so the stream is meant for reading/grepping, not parsing
+      as strict CSV.
 
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in

@@ -47,6 +47,18 @@ Set a config var on every staging app:
 heroku-scripts pipeline-cmd my-pipe staging "config:set EMAIL_SENDER=noreply@example.com"
 ```
 
+`pipeline-cmd` prints a header line followed by one record per app:
+
+```
+appname;output
+my-app;EMAIL_SENDER: noreply@example.com
+my-app-worker;EMAIL_SENDER: noreply@example.com
+```
+
+The output field is the app's raw combined heroku output, so it may span
+multiple lines and contain semicolons. Treat the stream as something to read
+or grep, not as strict CSV.
+
 Run a mix task on every production app, four at a time:
 
 ```sh
