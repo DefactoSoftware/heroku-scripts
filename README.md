@@ -67,7 +67,7 @@ HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my
 
 ```sh
 heroku-scripts apps <pipeline> <stage>
-heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream]
+heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 ```
@@ -100,6 +100,16 @@ Records stream out as each app finishes (in completion order), so output
 appears progressively instead of all at once at the end. Pass `--no-stream` to
 withhold output until every app finishes and print it sorted by app name —
 useful for reproducible, diff-friendly output.
+
+Apps whose output is empty (e.g. `config:get` for a var that isn't set) are
+skipped by default, and a count of skipped apps is printed to stderr. Pass
+`-a`/`--all` to include them:
+
+```sh
+heroku-scripts pipeline-cmd my-pipe production "config:get ADFS_METADATA_URL"
+# ...only apps that have the var...
+# 18 app(s) with empty output skipped (use -a/--all to include them)
+```
 
 The output field is the app's raw combined heroku output, so it may span
 multiple lines and contain semicolons. Treat the stream as something to read
