@@ -70,3 +70,20 @@ Move an app and its `-staging` sibling to another team and pipeline:
 ```sh
 heroku-scripts promote my-app defacto detroit
 ```
+
+`promote` runs destructive, largely irreversible operations, so it prints what
+it will do and asks for confirmation first. Pass `--dry-run` to preview the
+exact `heroku` commands, or `--yes` to skip the prompt.
+
+## Development
+
+Static analysis runs through [ShellCheck](https://www.shellcheck.net/) and the
+test suite through [bats](https://github.com/bats-core/bats-core); both run in
+CI on every push:
+
+```sh
+shellcheck bin/heroku-scripts
+bats test
+```
+
+The tests stub the `heroku` CLI on `PATH`, so they never touch a real account.
