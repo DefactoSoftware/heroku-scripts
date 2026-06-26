@@ -68,7 +68,7 @@ heroku-scripts pipeline-task my-pipe production GiveRaiseToPeople --concurrency=
 Move an app and its `-staging` sibling to another team and pipeline:
 
 ```sh
-heroku-scripts promote my-app defacto detroit
+heroku-scripts promote my-app my-team my-pipe
 ```
 
 `promote` runs destructive, largely irreversible operations, so it prints what
