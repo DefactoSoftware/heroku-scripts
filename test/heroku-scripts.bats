@@ -105,9 +105,9 @@ STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"app-one;value-for-app-one"* ]]
   [[ "$output" != *"app-three"* ]]
-  # A blank line separates the output from the summary.
-  [ -z "${stderr_lines[0]}" ]
-  [[ "${stderr_lines[1]}" == *"1 app(s) with empty output skipped"* ]]
+  # A blank line separates the output from the summary (stderr starts with \n).
+  [[ "$stderr" == $'\n'* ]]
+  [[ "$stderr" == *"1 app(s) with empty output skipped"* ]]
   [[ "$stderr" == *"-a/--all"* ]]
   # stderr is not a terminal under `run`, so no ANSI styling is emitted.
   [[ "$stderr" != *$'\033'* ]]
