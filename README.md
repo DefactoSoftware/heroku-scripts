@@ -24,6 +24,45 @@ curl -fsSL https://raw.githubusercontent.com/DefactoSoftware/heroku-scripts/main
 chmod +x ~/.local/bin/heroku-scripts
 ```
 
+## Authentication
+
+The `heroku` CLI must be authenticated. heroku-scripts picks credentials in
+this order:
+
+1. **`HEROKU_API_KEY`** — if already set, it is used as-is, so
+   `HEROKU_API_KEY=… heroku-scripts …` always works.
+2. **1Password** — if `HEROKU_SCRIPTS_OP_REF` holds a [1Password secret
+   reference](https://developer.1password.com/docs/cli/secret-references/) and
+   `HEROKU_API_KEY` is not set, the key is read once via the [1Password
+   CLI](https://developer.1password.com/docs/cli/) (`op`) and reused for every
+   call.
+3. Otherwise the heroku CLI's own stored login (`heroku login`) is used.
+
+### Why the 1Password option exists
+
+If your heroku credentials are brokered by 1Password (shell plugin / desktop
+app), every `heroku` call triggers an interactive approval and account
+selector. `pipeline-cmd` runs heroku in parallel, backgrounded subshells with
+no controlling terminal, so those prompts can't be answered and the run stalls.
+Resolving the key **once, up front** sidesteps this: 1Password approves a single
+time and the exported key flows to every child process.
+
+Store your Heroku API key in 1Password, then point the script at it (add this to
+your shell profile):
+
+```sh
+export HEROKU_SCRIPTS_OP_REF="op://Private/Heroku/credential"
+```
+
+Get the reference from the 1Password app (right-click a field → _Copy Secret
+Reference_) or `op item get "Heroku" --format json`.
+
+Prefer not to configure the script? Use `op run` instead — no env var needed:
+
+```sh
+HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my-pipe staging
+```
+
 ## Usage
 
 ```sh
