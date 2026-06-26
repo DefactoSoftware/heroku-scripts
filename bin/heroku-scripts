@@ -79,6 +79,17 @@ heroku_for_app() {
   fi
 }
 
+# Runs `heroku` with the given arguments passed as a real argv array — NOT a
+# string through eval — against a single app, with ambient noise stripped.
+#
+# Used by promote, whose team and pipeline arguments are discrete values, not a
+# free-form shell command. Routing them through heroku_for_app's eval would let
+# a stray space, glob character, or shell metacharacter in a pasted/mistyped
+# name be word-split, glob-expanded, or executed; passing argv avoids all three.
+heroku_argv() {
+  heroku "$@" 2>&1 | strip_heroku_noise
+}
+
 cmd_pipeline_cmd() {
   if [[ $# -lt 3 ]]; then
     echo "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N]" >&2
@@ -187,16 +198,16 @@ cmd_promote() {
   echo "Promoting $staging and $app ->"
 
   echo "1. upgrading dynos to standard-1x..."
-  heroku_for_app "$staging" "dyno:resize standard-1x" | strip_heroku_noise
-  heroku_for_app "$app" "dyno:resize standard-1x" | strip_heroku_noise
+  heroku_argv dyno:resize standard-1x -a "$staging"
+  heroku_argv dyno:resize standard-1x -a "$app"
 
   echo "2. transferring ownership to $to_team..."
-  heroku_for_app "$staging" "apps:transfer $to_team" | strip_heroku_noise
-  heroku_for_app "$app" "apps:transfer $to_team" | strip_heroku_noise
+  heroku_argv apps:transfer "$to_team" -a "$staging"
+  heroku_argv apps:transfer "$to_team" -a "$app"
 
   echo "3. adding to pipeline $pipeline..."
-  heroku_for_app "$staging" "pipelines:add $pipeline -s staging" | strip_heroku_noise
-  heroku_for_app "$app" "pipelines:add $pipeline -s production" | strip_heroku_noise
+  heroku_argv pipelines:add "$pipeline" -s staging -a "$staging"
+  heroku_argv pipelines:add "$pipeline" -s production -a "$app"
 }
 
 main() {
