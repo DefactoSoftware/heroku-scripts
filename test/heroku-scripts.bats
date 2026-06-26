@@ -105,3 +105,55 @@ teardown() {
   [ "$status" -eq 0 ]
   [[ "$output" == "heroku-scripts "* ]]
 }
+
+# Replaces the argv-echo heroku stub with one that reveals the inherited
+# HEROKU_API_KEY, so we can assert the key reaches the (backgrounded) heroku.
+_heroku_stub_reveals_key() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-one        staging\n' "$2"; exit 0
+fi
+echo "key=${HEROKU_API_KEY:-unset}"
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "HEROKU_SCRIPTS_OP_REF resolves the key via op and passes it to heroku" {
+  _heroku_stub_reveals_key
+  cat > "$TESTDIR/bin/op" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = "read" ] && { echo "op-key-for:$2"; exit 0; }
+exit 1
+STUB
+  chmod +x "$TESTDIR/bin/op"
+
+  HEROKU_SCRIPTS_OP_REF="op://vault/Heroku/credential" \
+    run "$SCRIPT" pipeline-cmd mypipe staging "config"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"key=op-key-for:op://vault/Heroku/credential"* ]]
+}
+
+@test "an existing HEROKU_API_KEY is used as-is and op is never called" {
+  _heroku_stub_reveals_key
+  cat > "$TESTDIR/bin/op" <<'STUB'
+#!/usr/bin/env bash
+echo "op should not have been called" >&2; exit 99
+STUB
+  chmod +x "$TESTDIR/bin/op"
+
+  HEROKU_API_KEY="preset-key" HEROKU_SCRIPTS_OP_REF="op://vault/Heroku/credential" \
+    run "$SCRIPT" pipeline-cmd mypipe staging "config"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"key=preset-key"* ]]
+  [[ "$output" != *"op should not have been called"* ]]
+}
+
+@test "HEROKU_SCRIPTS_OP_REF set but op missing fails clearly" {
+  # Restricted PATH: the heroku stub + coreutils, but no `op` anywhere.
+  PATH="$TESTDIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    HEROKU_SCRIPTS_OP_REF="op://vault/Heroku/credential" \
+    run "$SCRIPT" apps mypipe staging
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"1Password CLI"* ]]
+}

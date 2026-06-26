@@ -46,6 +46,12 @@ Commands:
       Print the script version.
 
 Requires the \`heroku\` CLI to be installed and authenticated.
+
+Authentication:
+  Uses HEROKU_API_KEY if set. Otherwise, if HEROKU_SCRIPTS_OP_REF holds a
+  1Password secret reference, the key is read from 1Password once via \`op\`
+  and reused for every call (avoids per-invocation interactive prompts):
+    export HEROKU_SCRIPTS_OP_REF="op://Private/Heroku/credential"
 EOF
 }
 
@@ -58,6 +64,30 @@ strip_heroku_noise() {
     | grep -vE '^[[:space:]]*›[[:space:]]+Warning: HEROKU_API_KEY is set' \
     | grep -vE '^[[:space:]]*-->[[:space:]]+Connecting to postgresql-' \
     || true
+}
+
+# Resolves HEROKU_API_KEY from 1Password once, in the foreground, before any of
+# the parallel/backgrounded heroku calls run.
+#
+# 1Password's heroku credential flow is interactive (a desktop approval and an
+# account selector). pipeline-cmd runs heroku in backgrounded subshells whose
+# stdin is /dev/null, so that prompt can't be answered and the run stalls.
+# Reading the key a single time here means 1Password approves once and every
+# child heroku process inherits the exported key — no per-invocation prompts.
+#
+# Opt in by exporting a 1Password secret reference, e.g. in your shell profile:
+#   export HEROKU_SCRIPTS_OP_REF="op://Private/Heroku/credential"
+# An existing HEROKU_API_KEY is left untouched, so prepending
+# `HEROKU_API_KEY=... heroku-scripts ...` still works and is taken as-is.
+resolve_heroku_api_key() {
+  [[ -n "${HEROKU_API_KEY:-}" ]] && return 0
+  local ref="${HEROKU_SCRIPTS_OP_REF:-}"
+  [[ -n "$ref" ]] || return 0
+  command -v op >/dev/null 2>&1 \
+    || die "HEROKU_SCRIPTS_OP_REF is set but the 1Password CLI ('op') is not installed"
+  HEROKU_API_KEY="$(op read "$ref")" \
+    || die "Could not read the Heroku API key from 1Password ($ref)"
+  export HEROKU_API_KEY
 }
 
 # Lists apps in <pipeline>/<stage>, one per line, on stdout.
@@ -105,6 +135,7 @@ parse_concurrency() {
 
 cmd_apps() {
   [[ $# -eq 2 ]] || die "Usage: $SCRIPT_NAME apps <pipeline> <stage>"
+  resolve_heroku_api_key
   apps_in_stage "$1" "$2"
 }
 
@@ -152,6 +183,8 @@ cmd_pipeline_cmd() {
 
   local concurrency
   concurrency="$(parse_concurrency "$@")" || exit 1
+
+  resolve_heroku_api_key
 
   local apps
   apps="$(require_apps "$pipeline" "$stage")" || exit 1
@@ -222,6 +255,8 @@ cmd_pipeline_task() {
   local concurrency
   concurrency="$(parse_concurrency "$@")" || exit 1
 
+  resolve_heroku_api_key
+
   local apps
   apps="$(require_apps "$pipeline" "$stage")" || exit 1
 
@@ -283,6 +318,9 @@ cmd_promote() {
       *) echo "Aborted." >&2; exit 1;;
     esac
   fi
+
+  # A dry run prints commands without calling heroku, so it needs no credential.
+  [[ "$DRY_RUN" == "true" ]] || resolve_heroku_api_key
 
   echo "Promoting $staging and $app ->"
 
