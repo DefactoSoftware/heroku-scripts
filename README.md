@@ -26,9 +26,9 @@ Or just run `bin/heroku-scripts` directly from a clone.
 
 ```sh
 heroku-scripts apps <pipeline> <stage>
-heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>"
+heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
-heroku-scripts promote <app> <to-team> <pipeline>
+heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 ```
 
 Run `heroku-scripts help` for the full command list.
