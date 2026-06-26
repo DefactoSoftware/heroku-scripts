@@ -20,13 +20,15 @@ Commands:
   apps <pipeline> <stage>
       List apps in <pipeline>/<stage>, one per line.
 
-  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N]
+  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream]
       Run the given heroku command against every app in <pipeline>/<stage>,
       in chunks of N (default 3). Prints a header line \`appname;output\`
-      then one \`<app>;<output>\` record per app. The output field is the
-      app's raw combined heroku output and may contain newlines and
-      semicolons, so the stream is meant for reading/grepping, not parsing
-      as strict CSV.
+      then one \`<app>;<output>\` record per app, streamed as each app
+      finishes (so output appears progressively). With --no-stream, output
+      is withheld until every app finishes and emitted sorted by app name.
+      The output field is the app's raw combined heroku output and may
+      contain newlines and semicolons, so it is meant for reading/grepping,
+      not parsing as strict CSV.
 
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
@@ -177,12 +179,28 @@ heroku_argv() {
 }
 
 cmd_pipeline_cmd() {
-  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N]"
+  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N] [--no-stream]"
   local pipeline="$1" stage="$2" command="$3"
   shift 3
 
-  local concurrency
-  concurrency="$(parse_concurrency "$@")" || exit 1
+  # Pull the streaming flag out before handing the rest to parse_concurrency
+  # (which only knows --concurrency). Streaming is the default; --no-stream
+  # buffers and emits everything sorted by app name at the end.
+  local stream=true
+  local -a opts=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stream) stream=true;;
+      --no-stream) stream=false;;
+      *) opts+=("$1");;
+    esac
+    shift
+  done
+
+  local concurrency=3
+  if [[ ${#opts[@]} -gt 0 ]]; then
+    concurrency="$(parse_concurrency "${opts[@]}")" || exit 1
+  fi
 
   resolve_heroku_api_key
 
@@ -219,11 +237,25 @@ cmd_pipeline_cmd() {
     (
       # The subshell inherits `set -e`. We deliberately turn it off here so a
       # non-zero exit from heroku (e.g. pg:psql against an app without a DB)
-      # is captured into the CSV output column rather than killing the
-      # subshell before it can write the file.
+      # is captured into the output column rather than killing the subshell
+      # before it can emit its record.
       set +e
       output="$(heroku_for_app "$app" "$command" | strip_heroku_noise)"
-      printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
+      if [[ "$stream" == "true" ]]; then
+        # Print as soon as this app finishes. Serialize with an atomic mkdir
+        # lock so a multi-line record streams out in one piece even when apps
+        # finish at the same time; the lock is held only for the single printf,
+        # so contention is brief. Ignore SIGPIPE so that if the reader goes
+        # away (e.g. `| head`) the printf merely fails instead of killing the
+        # worker mid-write and leaving the lock held — which would hang the
+        # rest of the apps spinning on mkdir.
+        trap '' PIPE
+        while ! mkdir "$tmpdir/.lock" 2>/dev/null; do sleep 0.05; done
+        printf '%s;%s\n' "$app" "$output"
+        rmdir "$tmpdir/.lock"
+      else
+        printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
+      fi
     ) </dev/null &
     # Pre-increment so the expression value (and thus exit status) is the
     # new value — post-increment would return 0 on the first iteration and
@@ -236,15 +268,18 @@ cmd_pipeline_cmd() {
   done 3<<< "$apps"
   wait || true
 
-  # Emit per-app rows in a stable, app-name order. Bash sorts glob matches and
-  # heroku app names contain no whitespace or glob characters, so iterating the
-  # glob is deterministic — unlike `find`, whose order is filesystem-dependent.
-  # The `[[ -e ]]` guard makes the no-match case a no-op (the glob stays literal
-  # when $tmpdir is empty).
-  local f
-  for f in "$tmpdir"/*; do
-    [[ -e "$f" ]] && cat "$f"
-  done
+  # Streaming mode already printed each record. For --no-stream, emit the
+  # buffered per-app rows now, in a stable app-name order. Bash sorts glob
+  # matches and heroku app names contain no whitespace or glob characters, so
+  # iterating the glob is deterministic — unlike `find`, whose order is
+  # filesystem-dependent. The `[[ -e ]]` guard makes the no-match case a no-op
+  # (the glob stays literal when $tmpdir is empty).
+  if [[ "$stream" != "true" ]]; then
+    local f
+    for f in "$tmpdir"/*; do
+      [[ -e "$f" ]] && cat "$f"
+    done
+  fi
 }
 
 cmd_pipeline_task() {

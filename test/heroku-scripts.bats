@@ -50,6 +50,38 @@ teardown() {
   [[ "$output" == *"app-three;"* ]]
 }
 
+# heroku stub where app-one is slow, so completion order (app-three first)
+# differs from sorted order (app-one first).
+_heroku_stub_slow_app_one() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-one        staging\napp-three        staging\n' "$2"; exit 0
+fi
+[ "$3" = "app-one" ] && sleep 0.4
+echo "out-$3"
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "pipeline-cmd streams records in completion order by default" {
+  _heroku_stub_slow_app_one
+  run "$SCRIPT" pipeline-cmd mypipe staging "config" --concurrency=2
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;output" ]
+  [ "${lines[1]}" = "app-three;out-app-three" ]
+  [ "${lines[2]}" = "app-one;out-app-one" ]
+}
+
+@test "pipeline-cmd --no-stream emits rows sorted by app name" {
+  _heroku_stub_slow_app_one
+  run "$SCRIPT" pipeline-cmd mypipe staging "config" --concurrency=2 --no-stream
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;output" ]
+  [ "${lines[1]}" = "app-one;out-app-one" ]
+  [ "${lines[2]}" = "app-three;out-app-three" ]
+}
+
 @test "pipeline-cmd routes -a before a -- separator" {
   run "$SCRIPT" pipeline-cmd mypipe staging "ps:exec -- ls -la"
   [ "$status" -eq 0 ]
