@@ -101,16 +101,17 @@ STUB
 
 @test "pipeline-cmd skips empty output and reports a count on stderr" {
   _heroku_stub_app_three_empty
-  run --separate-stderr "$SCRIPT" pipeline-cmd mypipe staging "config:get X"
-  [ "$status" -eq 0 ]
-  [[ "$output" == *"app-one;value-for-app-one"* ]]
-  [[ "$output" != *"app-three"* ]]
-  # A blank line separates the output from the summary (stderr starts with \n).
-  [[ "$stderr" == $'\n'* ]]
-  [[ "$stderr" == *"1 app(s) with empty output skipped"* ]]
-  [[ "$stderr" == *"-a/--all"* ]]
-  # stderr is not a terminal under `run`, so no ANSI styling is emitted.
-  [[ "$stderr" != *$'\033'* ]]
+  # Capture to files rather than via `run`, whose stderr normalization (leading
+  # newline / empty-line handling) varies across bats versions.
+  "$SCRIPT" pipeline-cmd mypipe staging "config:get X" >stdout.txt 2>stderr.txt
+  grep -q "app-one;value-for-app-one" stdout.txt
+  ! grep -q "app-three" stdout.txt
+  # A blank line separates the output from the summary.
+  [ -z "$(head -n 1 stderr.txt)" ]
+  grep -q "1 app(s) with empty output skipped" stderr.txt
+  grep -q -- "-a/--all" stderr.txt
+  # stderr is not a terminal here, so no ANSI styling is emitted.
+  ! grep -qF $'\033' stderr.txt
 }
 
 @test "pipeline-cmd -a includes empty output and prints no skip summary" {
