@@ -21,10 +21,12 @@ Commands:
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
       <pipeline>/<stage>. Defaults to 3 concurrent runs.
 
-  promote <app> <to-team> <pipeline>
+  promote <app> <to-team> <pipeline> [--dry-run] [--yes]
       Resize dynos to standard-1x, transfer <app> and <app>-staging
       to <to-team>, and add them to <pipeline> under production /
-      staging respectively.
+      staging respectively. Prompts for confirmation first (these are
+      destructive, largely irreversible operations). --dry-run prints the
+      heroku commands without running them; --yes skips the prompt.
 
   help, --help, -h
       Show this help.
@@ -86,7 +88,14 @@ heroku_for_app() {
 # free-form shell command. Routing them through heroku_for_app's eval would let
 # a stray space, glob character, or shell metacharacter in a pasted/mistyped
 # name be word-split, glob-expanded, or executed; passing argv avoids all three.
+#
+# Honors $DRY_RUN: when "true" it prints the exact command (safely quoted)
+# instead of executing it, so promote can preview destructive operations.
 heroku_argv() {
+  if [[ "${DRY_RUN:-}" == "true" ]]; then
+    { printf 'would run: heroku'; printf ' %q' "$@"; printf '\n'; }
+    return 0
+  fi
   heroku "$@" 2>&1 | strip_heroku_noise
 }
 
@@ -188,12 +197,50 @@ cmd_pipeline_task() {
 }
 
 cmd_promote() {
-  if [[ $# -ne 3 ]]; then
-    echo "Usage: $SCRIPT_NAME promote <app> <to-team> <pipeline>" >&2
+  local DRY_RUN=false assume_yes=false
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) DRY_RUN=true;;
+      --yes|-y) assume_yes=true;;
+      --) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done; break;;
+      -*) echo "Unknown option: $1" >&2; exit 1;;
+      *) positional+=("$1");;
+    esac
+    shift
+  done
+
+  if [[ ${#positional[@]} -ne 3 ]]; then
+    echo "Usage: $SCRIPT_NAME promote <app> <to-team> <pipeline> [--dry-run] [--yes]" >&2
     exit 1
   fi
-  local app="$1" to_team="$2" pipeline="$3"
+  local app="${positional[0]}" to_team="${positional[1]}" pipeline="${positional[2]}"
   local staging="${app}-staging"
+
+  # Spell out exactly what is about to happen. apps:transfer in particular is
+  # effectively irreversible from the sender's side, so the operator gets a
+  # clear preview and an explicit confirmation before anything runs.
+  {
+    echo "About to promote:"
+    echo "  app:      $app"
+    echo "  staging:  $staging"
+    echo "  team:     $to_team"
+    echo "  pipeline: $pipeline"
+    echo
+    echo "This resizes both dynos to standard-1x, TRANSFERS ownership to team"
+    echo "'$to_team' (irreversible without the receiving team transferring back),"
+    echo "and adds both apps to pipeline '$pipeline'."
+    echo
+  } >&2
+
+  if [[ "$DRY_RUN" != "true" && "$assume_yes" != "true" ]]; then
+    local reply
+    read -r -p "Proceed? [y/N] " reply || reply=""
+    case "$reply" in
+      y|Y|yes|Yes|YES) ;;
+      *) echo "Aborted." >&2; exit 1;;
+    esac
+  fi
 
   echo "Promoting $staging and $app ->"
 
