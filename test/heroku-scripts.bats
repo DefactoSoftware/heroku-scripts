@@ -123,6 +123,50 @@ STUB
   [[ "$stderr" != *"skipped"* ]]
 }
 
+# heroku stub: app-one has a single-line value, app-three is multi-line.
+_heroku_stub_multiline() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-one        staging\napp-three        staging\n' "$2"; exit 0
+fi
+app=""; prev=""
+for a in "$@"; do [[ "$prev" == "-a" ]] && app="$a"; prev="$a"; done
+case "$app" in
+  app-one)   echo "single-value";;
+  app-three) printf 'line-one\nline-two\n';;
+esac
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "pipeline-cmd --table renders an aligned table" {
+  _heroku_stub_multiline
+  run "$SCRIPT" pipeline-cmd mypipe staging "config:get X" --table --no-stream
+  [ "$status" -eq 0 ]
+  # Column width is the widest app name (app-three = 9).
+  [ "${lines[0]}" = "appname   | output" ]
+  [[ "${lines[1]}" == *"-+-"* ]]
+  [ "${lines[2]}" = "app-one   | single-value" ]
+}
+
+@test "pipeline-cmd --table aligns continuation lines of multi-line output" {
+  _heroku_stub_multiline
+  run "$SCRIPT" pipeline-cmd mypipe staging "config:get X" --table --no-stream
+  [ "$status" -eq 0 ]
+  [ "${lines[3]}" = "app-three | line-one" ]
+  # Continuation line: blank app cell, same pipe column, no app name.
+  [ "${lines[4]}" = "          | line-two" ]
+}
+
+@test "pipeline-cmd --csv forces CSV output" {
+  _heroku_stub_multiline
+  run "$SCRIPT" pipeline-cmd mypipe staging "config:get X" --csv --no-stream
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;output" ]
+  [ "${lines[1]}" = "app-one;single-value" ]
+}
+
 @test "pipeline-cmd routes -a before a -- separator" {
   run "$SCRIPT" pipeline-cmd mypipe staging "ps:exec -- ls -la"
   [ "$status" -eq 0 ]
