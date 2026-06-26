@@ -105,8 +105,12 @@ STUB
   [ "$status" -eq 0 ]
   [[ "$output" == *"app-one;value-for-app-one"* ]]
   [[ "$output" != *"app-three"* ]]
-  [[ "$stderr" == *"1 app(s) with empty output skipped"* ]]
+  # A blank line separates the output from the summary.
+  [ -z "${stderr_lines[0]}" ]
+  [[ "${stderr_lines[1]}" == *"1 app(s) with empty output skipped"* ]]
   [[ "$stderr" == *"-a/--all"* ]]
+  # stderr is not a terminal under `run`, so no ANSI styling is emitted.
+  [[ "$stderr" != *$'\033'* ]]
 }
 
 @test "pipeline-cmd -a includes empty output and prints no skip summary" {

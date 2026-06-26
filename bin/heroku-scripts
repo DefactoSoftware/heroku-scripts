@@ -293,11 +293,18 @@ cmd_pipeline_cmd() {
   fi
 
   # Report how many apps were skipped for empty output, on stderr so it never
-  # pollutes the data stream piped from stdout.
+  # pollutes the data stream piped from stdout. Separated from the output by a
+  # blank line and rendered dim + italic — but only when stderr is a terminal
+  # and NO_COLOR is unset, so redirected/piped output stays plain text.
   local skipped
   skipped="$(find "$tmpdir/.skipped" -type f | wc -l | tr -d ' ')"
   if (( skipped > 0 )); then
-    echo "$skipped app(s) with empty output skipped (use -a/--all to include them)" >&2
+    local msg="$skipped app(s) with empty output skipped (use -a/--all to include them)"
+    if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+      printf '\n\033[2;3m%s\033[0m\n' "$msg" >&2
+    else
+      printf '\n%s\n' "$msg" >&2
+    fi
   fi
 }
 
