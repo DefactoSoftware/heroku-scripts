@@ -5,6 +5,9 @@
 # a fixed pipelines:info table and otherwise echoes its argv (bracketed) so we
 # can assert on how arguments are routed.
 
+# `run --separate-stderr` (used by the empty-output tests) needs bats >= 1.5.0.
+bats_require_minimum_version 1.5.0
+
 setup() {
   TESTDIR="$(mktemp -d)"
   mkdir -p "$TESTDIR/bin"
@@ -80,6 +83,39 @@ STUB
   [ "${lines[0]}" = "appname;output" ]
   [ "${lines[1]}" = "app-one;out-app-one" ]
   [ "${lines[2]}" = "app-three;out-app-three" ]
+}
+
+# heroku stub where app-one has output but app-three is empty.
+_heroku_stub_app_three_empty() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-one        staging\napp-three        staging\n' "$2"; exit 0
+fi
+app=""; prev=""
+for a in "$@"; do [[ "$prev" == "-a" ]] && app="$a"; prev="$a"; done
+[ "$app" = "app-one" ] && echo "value-for-app-one"
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "pipeline-cmd skips empty output and reports a count on stderr" {
+  _heroku_stub_app_three_empty
+  run --separate-stderr "$SCRIPT" pipeline-cmd mypipe staging "config:get X"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-one;value-for-app-one"* ]]
+  [[ "$output" != *"app-three"* ]]
+  [[ "$stderr" == *"1 app(s) with empty output skipped"* ]]
+  [[ "$stderr" == *"-a/--all"* ]]
+}
+
+@test "pipeline-cmd -a includes empty output and prints no skip summary" {
+  _heroku_stub_app_three_empty
+  run --separate-stderr "$SCRIPT" pipeline-cmd mypipe staging "config:get X" -a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-one;value-for-app-one"* ]]
+  [[ "$output" == *"app-three;"* ]]
+  [[ "$stderr" != *"skipped"* ]]
 }
 
 @test "pipeline-cmd routes -a before a -- separator" {

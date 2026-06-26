@@ -20,15 +20,16 @@ Commands:
   apps <pipeline> <stage>
       List apps in <pipeline>/<stage>, one per line.
 
-  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream]
+  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a]
       Run the given heroku command against every app in <pipeline>/<stage>,
       in chunks of N (default 3). Prints a header line \`appname;output\`
       then one \`<app>;<output>\` record per app, streamed as each app
       finishes (so output appears progressively). With --no-stream, output
       is withheld until every app finishes and emitted sorted by app name.
-      The output field is the app's raw combined heroku output and may
-      contain newlines and semicolons, so it is meant for reading/grepping,
-      not parsing as strict CSV.
+      Apps with empty output are skipped (a count is reported on stderr);
+      pass -a/--all to include them. The output field is the app's raw
+      combined heroku output and may contain newlines and semicolons, so it
+      is meant for reading/grepping, not parsing as strict CSV.
 
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
@@ -183,15 +184,17 @@ cmd_pipeline_cmd() {
   local pipeline="$1" stage="$2" command="$3"
   shift 3
 
-  # Pull the streaming flag out before handing the rest to parse_concurrency
-  # (which only knows --concurrency). Streaming is the default; --no-stream
-  # buffers and emits everything sorted by app name at the end.
-  local stream=true
+  # Pull our own flags out before handing the rest to parse_concurrency (which
+  # only knows --concurrency). Streaming is the default; --no-stream buffers and
+  # emits everything sorted by app name at the end. Apps whose output is empty
+  # are skipped by default; -a/--all includes them.
+  local stream=true include_empty=false
   local -a opts=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --stream) stream=true;;
       --no-stream) stream=false;;
+      -a|--all) include_empty=true;;
       *) opts+=("$1");;
     esac
     shift
@@ -220,6 +223,11 @@ cmd_pipeline_cmd() {
   # shellcheck disable=SC2064
   trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$tmpdir'; exit 130" INT TERM
 
+  # Workers drop a marker file here for each app skipped due to empty output, so
+  # the parent can report a count after they all finish. A dotfile dir, so the
+  # --no-stream collection glob (`$tmpdir/*`) never picks it up.
+  mkdir "$tmpdir/.skipped"
+
   echo "appname;output"
 
   # Process apps in chunks of $concurrency. Waiting for each chunk to drain
@@ -241,7 +249,10 @@ cmd_pipeline_cmd() {
       # before it can emit its record.
       set +e
       output="$(heroku_for_app "$app" "$command" | strip_heroku_noise)"
-      if [[ "$stream" == "true" ]]; then
+      if [[ -z "$output" && "$include_empty" != "true" ]]; then
+        # Empty output: record the skip for the summary and emit no record.
+        : > "$tmpdir/.skipped/$app"
+      elif [[ "$stream" == "true" ]]; then
         # Print as soon as this app finishes. Serialize with an atomic mkdir
         # lock so a multi-line record streams out in one piece even when apps
         # finish at the same time; the lock is held only for the single printf,
@@ -279,6 +290,14 @@ cmd_pipeline_cmd() {
     for f in "$tmpdir"/*; do
       [[ -e "$f" ]] && cat "$f"
     done
+  fi
+
+  # Report how many apps were skipped for empty output, on stderr so it never
+  # pollutes the data stream piped from stdout.
+  local skipped
+  skipped="$(find "$tmpdir/.skipped" -type f | wc -l | tr -d ' ')"
+  if (( skipped > 0 )); then
+    echo "$skipped app(s) with empty output skipped (use -a/--all to include them)" >&2
   fi
 }
 
