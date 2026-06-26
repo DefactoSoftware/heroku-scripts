@@ -67,7 +67,7 @@ HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my
 
 ```sh
 heroku-scripts apps <pipeline> <stage>
-heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a]
+heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a] [--table|--csv]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 ```
@@ -88,16 +88,27 @@ Set a config var on every staging app:
 heroku-scripts pipeline-cmd my-pipe staging "config:set EMAIL_SENDER=noreply@example.com"
 ```
 
-`pipeline-cmd` prints a header line followed by one record per app:
+`pipeline-cmd` prints one record per app. On a terminal it renders an aligned
+table; when the output is piped or redirected it switches to CSV
+(`appname;output`) so it stays easy to parse and grep. Force either with
+`--table` or `--csv`.
 
 ```
+# on a terminal
+appname        | output
+---------------+-----------------------------------------
+my-app         | EMAIL_SENDER: noreply@example.com
+my-app-worker  | EMAIL_SENDER: noreply@example.com
+
+# piped
 appname;output
 my-app;EMAIL_SENDER: noreply@example.com
 my-app-worker;EMAIL_SENDER: noreply@example.com
 ```
 
 Records stream out as each app finishes (in completion order), so output
-appears progressively instead of all at once at the end. Pass `--no-stream` to
+appears progressively instead of all at once at the end — table mode included,
+since the column width comes from the app list. Pass `--no-stream` to
 withhold output until every app finishes and print it sorted by app name —
 useful for reproducible, diff-friendly output.
 
