@@ -149,7 +149,7 @@ test suite through [bats](https://github.com/bats-core/bats-core); both run in
 CI on every push:
 
 ```sh
-shellcheck bin/heroku-scripts
+shellcheck bin/heroku-scripts install.sh
 bats test
 ```
 
