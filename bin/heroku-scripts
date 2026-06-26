@@ -50,10 +50,12 @@ EOF
 }
 
 # Strips ambient noise the heroku CLI prints around every invocation: the
-# "heroku update available" banner and pg:psql's "--> Connecting to ..." line.
+# "heroku update available" banner, the "HEROKU_API_KEY is set" auth notice,
+# and pg:psql's "--> Connecting to ..." line.
 # `|| true` keeps grep's "no matches" exit from tripping `set -e`.
 strip_heroku_noise() {
   grep -vE '^[[:space:]]*›[[:space:]]+Warning: heroku update available' \
+    | grep -vE '^[[:space:]]*›[[:space:]]+Warning: HEROKU_API_KEY is set' \
     | grep -vE '^[[:space:]]*-->[[:space:]]+Connecting to postgresql-' \
     || true
 }
