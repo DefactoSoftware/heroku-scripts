@@ -136,7 +136,14 @@ cmd_pipeline_cmd() {
   tmpdir="$(mktemp -d)"
   # Interpolate $tmpdir into the trap *now*, not at fire time — by the time
   # the EXIT trap runs, this function has returned and the local is gone.
+  # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" EXIT
+  # On an external INT/TERM (cron, a wrapper script, plain `kill`, systemd
+  # stop) the signal reaches only the parent. Without this, the backgrounded
+  # heroku subshells are orphaned and keep running while the EXIT trap deletes
+  # the tmpdir out from under them. Tear the jobs down first, then clean up.
+  # shellcheck disable=SC2064
+  trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$tmpdir'; exit 130" INT TERM
 
   echo "appname;output"
 
