@@ -5,6 +5,12 @@ set -euo pipefail
 
 SCRIPT_NAME="${0##*/}"
 
+# Prints a message to stderr and exits non-zero.
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
 usage() {
   cat <<EOF
 Usage: $SCRIPT_NAME <command> [args...]
@@ -61,11 +67,38 @@ apps_in_stage() {
     | awk -v stage="$stage" 'NF >= 2 && $NF == stage { print $1 }'
 }
 
-cmd_apps() {
-  if [[ $# -ne 2 ]]; then
-    echo "Usage: $SCRIPT_NAME apps <pipeline> <stage>" >&2
-    exit 1
+# Prints the apps in <pipeline>/<stage> on stdout, or dies if the stage has
+# none. The empty-stage check lives here so every caller gets it for free.
+require_apps() {
+  local pipeline="$1" stage="$2" apps
+  apps="$(apps_in_stage "$pipeline" "$stage")"
+  [[ -n "$apps" ]] || die "No apps found in $pipeline/$stage"
+  printf '%s\n' "$apps"
+}
+
+# Parses the option arguments that follow a subcommand's positional ones and
+# echoes the validated concurrency (default 3) on stdout. Only --concurrency=N
+# is accepted. On an unknown option or a non-positive-integer value it prints an
+# error and returns 1, so callers use:
+#   concurrency="$(parse_concurrency "$@")" || exit 1
+parse_concurrency() {
+  local concurrency=3
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --concurrency=*) concurrency="${1#*=}";;
+      *) echo "Unknown option: $1" >&2; return 1;;
+    esac
+    shift
+  done
+  if [[ ! "$concurrency" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--concurrency must be a positive integer" >&2
+    return 1
   fi
+  printf '%s\n' "$concurrency"
+}
+
+cmd_apps() {
+  [[ $# -eq 2 ]] || die "Usage: $SCRIPT_NAME apps <pipeline> <stage>"
   apps_in_stage "$1" "$2"
 }
 
@@ -107,33 +140,15 @@ heroku_argv() {
 }
 
 cmd_pipeline_cmd() {
-  if [[ $# -lt 3 ]]; then
-    echo "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N]" >&2
-    exit 1
-  fi
+  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N]"
   local pipeline="$1" stage="$2" command="$3"
   shift 3
 
-  local concurrency=3
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --concurrency=*) concurrency="${1#*=}";;
-      *) echo "Unknown option: $1" >&2; exit 1;;
-    esac
-    shift
-  done
-
-  if [[ ! "$concurrency" =~ ^[1-9][0-9]*$ ]]; then
-    echo "--concurrency must be a positive integer" >&2
-    exit 1
-  fi
+  local concurrency
+  concurrency="$(parse_concurrency "$@")" || exit 1
 
   local apps
-  apps="$(apps_in_stage "$pipeline" "$stage")"
-  if [[ -z "$apps" ]]; then
-    echo "No apps found in $pipeline/$stage" >&2
-    exit 1
-  fi
+  apps="$(require_apps "$pipeline" "$stage")" || exit 1
 
   local tmpdir
   tmpdir="$(mktemp -d)"
@@ -194,33 +209,15 @@ cmd_pipeline_cmd() {
 }
 
 cmd_pipeline_task() {
-  if [[ $# -lt 3 ]]; then
-    echo "Usage: $SCRIPT_NAME pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]" >&2
-    exit 1
-  fi
+  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]"
   local pipeline="$1" stage="$2" task="$3"
   shift 3
 
-  local concurrency=3
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --concurrency=*) concurrency="${1#*=}";;
-      *) echo "Unknown option: $1" >&2; exit 1;;
-    esac
-    shift
-  done
-
-  if [[ ! "$concurrency" =~ ^[1-9][0-9]*$ ]]; then
-    echo "--concurrency must be a positive integer" >&2
-    exit 1
-  fi
+  local concurrency
+  concurrency="$(parse_concurrency "$@")" || exit 1
 
   local apps
-  apps="$(apps_in_stage "$pipeline" "$stage")"
-  if [[ -z "$apps" ]]; then
-    echo "No apps found in $pipeline/$stage" >&2
-    exit 1
-  fi
+  apps="$(require_apps "$pipeline" "$stage")" || exit 1
 
   # Best-effort, like pipeline-cmd: a single app's failure is reported with its
   # name and does not abort the whole run. Without the wrapping `sh -c ... ||`,
@@ -244,15 +241,14 @@ cmd_promote() {
       --dry-run) DRY_RUN=true;;
       --yes|-y) assume_yes=true;;
       --) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done; break;;
-      -*) echo "Unknown option: $1" >&2; exit 1;;
+      -*) die "Unknown option: $1";;
       *) positional+=("$1");;
     esac
     shift
   done
 
   if [[ ${#positional[@]} -ne 3 ]]; then
-    echo "Usage: $SCRIPT_NAME promote <app> <to-team> <pipeline> [--dry-run] [--yes]" >&2
-    exit 1
+    die "Usage: $SCRIPT_NAME promote <app> <to-team> <pipeline> [--dry-run] [--yes]"
   fi
   local app="${positional[0]}" to_team="${positional[1]}" pipeline="${positional[2]}"
   local staging="${app}-staging"
