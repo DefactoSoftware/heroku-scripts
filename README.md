@@ -13,14 +13,16 @@ Replaces the older Elixir version of this tool.
 
 ## Install
 
-Drop the script somewhere on your `$PATH`:
-
 ```sh
-git clone https://github.com/defactosoftware/heroku-scripts.git
-ln -s "$(pwd)/heroku-scripts/bin/heroku-scripts" /usr/local/bin/heroku-scripts
+curl -fsSL https://raw.githubusercontent.com/DefactoSoftware/heroku-scripts/main/install.sh | sh
 ```
 
-Or just run `bin/heroku-scripts` directly from a clone.
+Or manually:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DefactoSoftware/heroku-scripts/main/bin/heroku-scripts -o ~/.local/bin/heroku-scripts
+chmod +x ~/.local/bin/heroku-scripts
+```
 
 ## Usage
 
