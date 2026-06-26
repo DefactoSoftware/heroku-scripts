@@ -77,7 +77,10 @@ cmd_apps() {
 heroku_for_app() {
   local app="$1" cmd="$2"
   if [[ " $cmd " == *" -- "* ]]; then
-    local before="${cmd% -- *}"
+    # Split on the FIRST `--`: %% strips the longest ` -- *` suffix (everything
+    # from the first separator on) and #* strips up to the first separator, so
+    # both halves agree even when the remote command contains its own `--`.
+    local before="${cmd%% -- *}"
     local after="${cmd#* -- }"
     eval "heroku $before -a \"\$app\" -- $after" 2>&1
   else
