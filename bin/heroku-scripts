@@ -182,9 +182,15 @@ cmd_pipeline_cmd() {
   done 3<<< "$apps"
   wait || true
 
-  # `find -exec cat` is a no-op when no files matched, which is safer than
-  # `cat $tmpdir/*` (would fail on an empty tmpdir).
-  find "$tmpdir" -type f -exec cat {} +
+  # Emit per-app rows in a stable, app-name order. Bash sorts glob matches and
+  # heroku app names contain no whitespace or glob characters, so iterating the
+  # glob is deterministic — unlike `find`, whose order is filesystem-dependent.
+  # The `[[ -e ]]` guard makes the no-match case a no-op (the glob stays literal
+  # when $tmpdir is empty).
+  local f
+  for f in "$tmpdir"/*; do
+    [[ -e "$f" ]] && cat "$f"
+  done
 }
 
 cmd_pipeline_task() {
