@@ -20,16 +20,19 @@ Commands:
   apps <pipeline> <stage>
       List apps in <pipeline>/<stage>, one per line.
 
-  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a]
+  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a] [--table|--csv]
       Run the given heroku command against every app in <pipeline>/<stage>,
-      in chunks of N (default 3). Prints a header line \`appname;output\`
-      then one \`<app>;<output>\` record per app, streamed as each app
-      finishes (so output appears progressively). With --no-stream, output
-      is withheld until every app finishes and emitted sorted by app name.
-      Apps with empty output are skipped (a count is reported on stderr);
-      pass -a/--all to include them. The output field is the app's raw
-      combined heroku output and may contain newlines and semicolons, so it
-      is meant for reading/grepping, not parsing as strict CSV.
+      in chunks of N (default 3). One record per app is emitted as each app
+      finishes (so output appears progressively); --no-stream withholds output
+      until every app finishes and emits it sorted by app name. Apps with empty
+      output are skipped (a count is reported on stderr); pass -a/--all to
+      include them.
+
+      On a terminal the output is an aligned table (\`appname | output\`);
+      when piped it is CSV (\`appname;output\`). Force either with --table or
+      --csv. The output field is the app's raw combined heroku output and may
+      contain newlines and semicolons, so the CSV is for reading/grepping, not
+      parsing as strict CSV.
 
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
@@ -179,22 +182,89 @@ heroku_argv() {
   heroku "$@" 2>&1 | strip_heroku_noise
 }
 
+# Width of the app-name column for table rendering: the longest app name, but at
+# least the header's own width. App names are known before any heroku command
+# runs, so this is computed up front — which is what lets table output stream
+# (the only column needing a fixed width is the left one).
+app_column_width() {
+  local list="$1" width=7 a   # 7 = len("appname")
+  while IFS= read -r a; do
+    [[ -z "$a" ]] && continue
+    (( ${#a} > width )) && width=${#a}
+  done <<< "$list"
+  printf '%s' "$width"
+}
+
+# Prints n copies of a single character (nothing when n <= 0).
+repeat_char() {
+  local char="$1" n="$2"
+  (( n > 0 )) || return 0
+  printf '%*s' "$n" '' | tr ' ' "$char"
+}
+
+# Prints the aligned-table header and its rule. The output column is open-ended
+# (no right border), so the rule just runs to the terminal width.
+print_table_header() {
+  local width="$1" cols=80 right
+  printf '%-*s | %s\n' "$width" "appname" "output"
+  # Size the rule to the terminal when stdout is one; fall back to 80 when it is
+  # redirected (forced --table) or tput returns anything non-numeric.
+  if [[ -t 1 ]]; then
+    cols="$(tput cols 2>/dev/null || echo 80)"
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  fi
+  right=$(( cols - width - 3 ))
+  (( right < 6 )) && right=6
+  printf '%s-+-%s\n' "$(repeat_char '-' "$width")" "$(repeat_char '-' "$right")"
+}
+
+# Emits one app's record in the requested format.
+#   csv:   app;output  (output verbatim; may span lines / contain ';')
+#   table: app padded to $width, " | ", then output. Continuation lines of a
+#          multi-line output get a blank app cell so they stay aligned.
+emit_record() {
+  local fmt="$1" width="$2" app="$3" output="$4"
+  if [[ "$fmt" != "table" ]]; then
+    printf '%s;%s\n' "$app" "$output"
+    return
+  fi
+  if [[ -z "$output" ]]; then
+    printf '%-*s |\n' "$width" "$app"
+    return
+  fi
+  # `|| break` stops on the first failed write so a vanished reader (e.g.
+  # `--table | head`) doesn't keep looping with SIGPIPE ignored — that would
+  # hold the streaming lock and emit one broken-pipe error per remaining line.
+  local first=1 line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( first )); then
+      printf '%-*s | %s\n' "$width" "$app" "$line" || break
+      first=0
+    else
+      printf '%-*s | %s\n' "$width" "" "$line" || break
+    fi
+  done <<< "$output"
+}
+
 cmd_pipeline_cmd() {
-  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N] [--no-stream]"
+  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N] [--no-stream] [-a] [--table|--csv]"
   local pipeline="$1" stage="$2" command="$3"
   shift 3
 
   # Pull our own flags out before handing the rest to parse_concurrency (which
   # only knows --concurrency). Streaming is the default; --no-stream buffers and
   # emits everything sorted by app name at the end. Apps whose output is empty
-  # are skipped by default; -a/--all includes them.
-  local stream=true include_empty=false
+  # are skipped by default; -a/--all includes them. Output format defaults to a
+  # table on a terminal and CSV when piped; --table/--csv force one.
+  local stream=true include_empty=false format=auto
   local -a opts=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --stream) stream=true;;
       --no-stream) stream=false;;
       -a|--all) include_empty=true;;
+      --table) format=table;;
+      --csv) format=csv;;
       *) opts+=("$1");;
     esac
     shift
@@ -209,6 +279,15 @@ cmd_pipeline_cmd() {
 
   local apps
   apps="$(require_apps "$pipeline" "$stage")" || exit 1
+
+  # Resolve auto -> table on a terminal, CSV when piped. The table's left column
+  # is sized from the (already known) app list, so table output still streams.
+  local render="$format"
+  if [[ "$render" == "auto" ]]; then
+    if [[ -t 1 ]]; then render=table; else render=csv; fi
+  fi
+  local width=7
+  [[ "$render" == "table" ]] && width="$(app_column_width "$apps")"
 
   local tmpdir
   tmpdir="$(mktemp -d)"
@@ -228,7 +307,11 @@ cmd_pipeline_cmd() {
   # --no-stream collection glob (`$tmpdir/*`) never picks it up.
   mkdir "$tmpdir/.skipped"
 
-  echo "appname;output"
+  if [[ "$render" == "table" ]]; then
+    print_table_header "$width"
+  else
+    echo "appname;output"
+  fi
 
   # Process apps in chunks of $concurrency. Waiting for each chunk to drain
   # before starting the next caps resource use; running every app in parallel
@@ -254,18 +337,20 @@ cmd_pipeline_cmd() {
         : > "$tmpdir/.skipped/$app"
       elif [[ "$stream" == "true" ]]; then
         # Print as soon as this app finishes. Serialize with an atomic mkdir
-        # lock so a multi-line record streams out in one piece even when apps
-        # finish at the same time; the lock is held only for the single printf,
-        # so contention is brief. Ignore SIGPIPE so that if the reader goes
-        # away (e.g. `| head`) the printf merely fails instead of killing the
-        # worker mid-write and leaving the lock held — which would hang the
-        # rest of the apps spinning on mkdir.
+        # lock so a record streams out in one piece (emit_record may write
+        # several lines for multi-line/table output) even when apps finish at
+        # the same time; contention is brief. Ignore SIGPIPE so that if the
+        # reader goes away (e.g. `| head`) the writes merely fail instead of
+        # killing the worker mid-record and leaving the lock held; emit_record
+        # breaks on the first failed write so the lock is released promptly.
         trap '' PIPE
         while ! mkdir "$tmpdir/.lock" 2>/dev/null; do sleep 0.05; done
-        printf '%s;%s\n' "$app" "$output"
+        emit_record "$render" "$width" "$app" "$output"
         rmdir "$tmpdir/.lock"
       else
-        printf '%s;%s\n' "$app" "$output" > "$tmpdir/$app"
+        # Buffered: store the raw output (filename is the app name) and format
+        # it sorted at the end.
+        printf '%s' "$output" > "$tmpdir/$app"
       fi
     ) </dev/null &
     # Pre-increment so the expression value (and thus exit status) is the
@@ -283,12 +368,13 @@ cmd_pipeline_cmd() {
   # buffered per-app rows now, in a stable app-name order. Bash sorts glob
   # matches and heroku app names contain no whitespace or glob characters, so
   # iterating the glob is deterministic — unlike `find`, whose order is
-  # filesystem-dependent. The `[[ -e ]]` guard makes the no-match case a no-op
-  # (the glob stays literal when $tmpdir is empty).
+  # filesystem-dependent. The `[[ -f ]]` guard makes the no-match case a no-op
+  # (the glob stays literal when $tmpdir has no app files).
   if [[ "$stream" != "true" ]]; then
     local f
     for f in "$tmpdir"/*; do
-      [[ -e "$f" ]] && cat "$f"
+      [[ -f "$f" ]] || continue
+      emit_record "$render" "$width" "${f##*/}" "$(cat "$f")"
     done
   fi
 
