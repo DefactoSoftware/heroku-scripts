@@ -67,7 +67,7 @@ HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my
 
 ```sh
 heroku-scripts apps <pipeline> <stage>
-heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N]
+heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 ```
@@ -95,6 +95,11 @@ appname;output
 my-app;EMAIL_SENDER: noreply@example.com
 my-app-worker;EMAIL_SENDER: noreply@example.com
 ```
+
+Records stream out as each app finishes (in completion order), so output
+appears progressively instead of all at once at the end. Pass `--no-stream` to
+withhold output until every app finishes and print it sorted by app name —
+useful for reproducible, diff-friendly output.
 
 The output field is the app's raw combined heroku output, so it may span
 multiple lines and contain semicolons. Treat the stream as something to read
