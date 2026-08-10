@@ -266,6 +266,88 @@ STUB
   [[ "$output" != *"op should not have been called"* ]]
 }
 
+# heroku stub that counts its invocations in ./stub-calls (tests cd into
+# $TESTDIR, and the script's workers inherit that cwd) and fails with a
+# transient connection error until the third call.
+_heroku_stub_flaky_connection() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-one        staging\n' "$2"; exit 0
+fi
+n=$(cat ./stub-calls 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > ./stub-calls
+if [ "$n" -lt 3 ]; then
+  echo "Could not connect to dyno!"
+  exit 1
+fi
+echo "success-after-$n"
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "pipeline-cmd --retries re-runs transient connection errors until success" {
+  _heroku_stub_flaky_connection
+  HEROKU_SCRIPTS_RETRY_DELAY=0 \
+    run --separate-stderr "$SCRIPT" pipeline-cmd mypipe staging "ps:exec ls" --retries=2
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-one;success-after-3"* ]]
+  [[ "$stderr" == *"transient connection error, retrying (1/2)"* ]]
+  [[ "$stderr" == *"transient connection error, retrying (2/2)"* ]]
+}
+
+@test "pipeline-cmd without --retries keeps the single-attempt behavior" {
+  _heroku_stub_flaky_connection
+  run "$SCRIPT" pipeline-cmd mypipe staging "ps:exec ls"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-one;Could not connect to dyno!"* ]]
+  [ "$(cat stub-calls)" = "1" ]
+}
+
+@test "pipeline-cmd --retries surfaces a persistent transient error after the last attempt" {
+  _heroku_stub_flaky_connection
+  HEROKU_SCRIPTS_RETRY_DELAY=0 \
+    run --separate-stderr "$SCRIPT" pipeline-cmd mypipe staging "ps:exec ls" --retries=1
+  [ "$status" -eq 0 ]
+  # Two attempts (initial + 1 retry), both flaky, so the error is the record.
+  [[ "$output" == *"app-one;Could not connect to dyno!"* ]]
+  [ "$(cat stub-calls)" = "2" ]
+}
+
+# heroku stub that counts invocations and always fails with a NON-transient
+# error, so retries must not kick in.
+_heroku_stub_real_failure() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-one        staging\n' "$2"; exit 0
+fi
+n=$(cat ./stub-calls 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > ./stub-calls
+echo "bash: some-remote-cmd: command not found"
+exit 127
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "pipeline-cmd --retries never retries a genuine command failure" {
+  _heroku_stub_real_failure
+  HEROKU_SCRIPTS_RETRY_DELAY=0 \
+    run --separate-stderr "$SCRIPT" pipeline-cmd mypipe staging "ps:exec some-remote-cmd" --retries=3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-one;bash: some-remote-cmd: command not found"* ]]
+  [ "$(cat stub-calls)" = "1" ]
+  [[ "$stderr" != *"retrying"* ]]
+}
+
+@test "pipeline-cmd rejects a non-numeric retries value" {
+  run "$SCRIPT" pipeline-cmd mypipe staging "config" --retries=abc
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"non-negative integer"* ]]
+}
+
 @test "HEROKU_SCRIPTS_OP_REF set but op missing fails clearly" {
   # Restricted PATH: the heroku stub + coreutils, but no `op` anywhere.
   PATH="$TESTDIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
