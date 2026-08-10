@@ -20,13 +20,18 @@ Commands:
   apps <pipeline> <stage>
       List apps in <pipeline>/<stage>, one per line.
 
-  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a] [--table|--csv]
+  pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--retries=N] [--no-stream] [-a] [--table|--csv]
       Run the given heroku command against every app in <pipeline>/<stage>,
       in chunks of N (default 3). One record per app is emitted as each app
       finishes (so output appears progressively); --no-stream withholds output
       until every app finishes and emits it sorted by app name. Apps with empty
       output are skipped (a count is reported on stderr); pass -a/--all to
       include them.
+
+      --retries=N re-runs an app whose output matches a known *transient*
+      connection error (the ones ps:exec emits when Heroku's exec-manager or
+      the SSH tunnel hiccups), up to N extra attempts with increasing backoff.
+      Genuine command failures are never retried. Default is 0 (no retries).
 
       On a terminal the output is an aligned table (\`appname | output\`);
       when piped it is CSV (\`appname;output\`). Force either with --table or
@@ -164,6 +169,39 @@ heroku_for_app() {
   fi
 }
 
+# Errors that mean "the connection flaked, the command itself may be fine".
+# These are the messages ps:exec-style commands emit when Heroku's exec-manager
+# rejects the credential PUT, the SSH tunnel drops mid-session, or keepalives
+# time out — all observed to succeed on a plain re-run. Kept deliberately
+# narrow: anything else is treated as a real failure and is never retried.
+TRANSIENT_CONNECTION_ERRORS='Could not connect to dyno|error connecting to the dyno|Connection to the dyno timed out|networking error'
+
+# Runs heroku_for_app, re-running it up to $3 extra times when the combined
+# output matches TRANSIENT_CONNECTION_ERRORS. The final attempt's output is
+# printed either way, so a persistent failure still surfaces as the app's
+# record. Backoff grows linearly (15s, 30s, ...); HEROKU_SCRIPTS_RETRY_DELAY
+# overrides the 15s unit (the tests set it to 0).
+#
+# NOTE for callers: retrying re-runs the heroku command on the dyno, and a
+# mid-session drop can happen *after* the remote command started. Only pass
+# --retries for idempotent commands.
+heroku_for_app_with_retries() {
+  local app="$1" cmd="$2" retries="$3"
+  local delay="${HEROKU_SCRIPTS_RETRY_DELAY:-15}"
+  local attempt=0 output
+  while true; do
+    output="$(heroku_for_app "$app" "$cmd" | strip_heroku_noise)"
+    if (( attempt >= retries )) \
+      || ! grep -qE "$TRANSIENT_CONNECTION_ERRORS" <<< "$output"; then
+      printf '%s' "$output"
+      return 0
+    fi
+    (( ++attempt ))
+    echo "pipeline-cmd: $app: transient connection error, retrying ($attempt/$retries)" >&2
+    sleep $(( attempt * delay ))
+  done
+}
+
 # Runs `heroku` with the given arguments passed as a real argv array — NOT a
 # string through eval — against a single app, with ambient noise stripped.
 #
@@ -247,7 +285,7 @@ emit_record() {
 }
 
 cmd_pipeline_cmd() {
-  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N] [--no-stream] [-a] [--table|--csv]"
+  [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N] [--retries=N] [--no-stream] [-a] [--table|--csv]"
   local pipeline="$1" stage="$2" command="$3"
   shift 3
 
@@ -256,7 +294,7 @@ cmd_pipeline_cmd() {
   # emits everything sorted by app name at the end. Apps whose output is empty
   # are skipped by default; -a/--all includes them. Output format defaults to a
   # table on a terminal and CSV when piped; --table/--csv force one.
-  local stream=true include_empty=false format=auto
+  local stream=true include_empty=false format=auto retries=0
   local -a opts=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -265,10 +303,15 @@ cmd_pipeline_cmd() {
       -a|--all) include_empty=true;;
       --table) format=table;;
       --csv) format=csv;;
+      --retries=*) retries="${1#*=}";;
       *) opts+=("$1");;
     esac
     shift
   done
+
+  if [[ ! "$retries" =~ ^[0-9]+$ ]]; then
+    die "--retries must be a non-negative integer"
+  fi
 
   local concurrency=3
   if [[ ${#opts[@]} -gt 0 ]]; then
@@ -331,7 +374,7 @@ cmd_pipeline_cmd() {
       # is captured into the output column rather than killing the subshell
       # before it can emit its record.
       set +e
-      output="$(heroku_for_app "$app" "$command" | strip_heroku_noise)"
+      output="$(heroku_for_app_with_retries "$app" "$command" "$retries")"
       if [[ -z "$output" && "$include_empty" != "true" ]]; then
         # Empty output: record the skip for the summary and emit no record.
         : > "$tmpdir/.skipped/$app"

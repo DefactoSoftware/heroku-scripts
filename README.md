@@ -67,7 +67,7 @@ HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my
 
 ```sh
 heroku-scripts apps <pipeline> <stage>
-heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--no-stream] [-a] [--table|--csv]
+heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--retries=N] [--no-stream] [-a] [--table|--csv]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 ```
@@ -125,6 +125,26 @@ heroku-scripts pipeline-cmd my-pipe production "config:get ADFS_METADATA_URL"
 The output field is the app's raw combined heroku output, so it may span
 multiple lines and contain semicolons. Treat the stream as something to read
 or grep, not as strict CSV.
+
+### Retrying transient connection errors
+
+`ps:exec`-style commands occasionally fail with a transient connection error
+even though the dyno is up — Heroku's exec-manager rejects the credential
+handshake, the SSH tunnel drops mid-session, or keepalives time out. These
+show up more under parallel load and succeed on a plain re-run. Pass
+`--retries=N` to re-run an app up to N extra times (with increasing backoff)
+when its output matches one of those known-transient errors:
+
+```sh
+heroku-scripts pipeline-cmd my-pipe production 'ps:exec bin/rails runner "Some.task"' --retries=3
+```
+
+Genuine command failures — anything that doesn't match the known connection
+errors — are never retried, and a persistently failing app still emits its
+last error as its record. The default is `--retries=0` (unchanged behavior).
+
+One caveat: a mid-session drop can happen *after* the remote command started
+running, so only use `--retries` with commands that are safe to run twice.
 
 Run a mix task on every production app, four at a time:
 
