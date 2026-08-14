@@ -39,6 +39,18 @@ Commands:
       contain newlines and semicolons, so the CSV is for reading/grepping, not
       parsing as strict CSV.
 
+  config-replace <pipeline> <stage> <VAR> <old-value> <new-value> [--concurrency=N] [--dry-run] [-a|--all] [--table|--csv] [--no-stream]
+      For every app in <pipeline>/<stage>, set <VAR> to <new-value> — but
+      only on apps whose current value is exactly <old-value>. Apps without
+      <VAR> are skipped (a count is reported on stderr; -a/--all emits a
+      "not set" record for them instead). Apps whose value differs are left
+      untouched but get a visible "skipped: ..." record so drift is not
+      silent. --dry-run reads every current value and reports what would
+      change without setting anything. Concurrency, streaming, and
+      table/CSV output behave as in pipeline-cmd. Note: config:get prints
+      the same empty line for an unset var and one set to the empty string,
+      so a var set to "" is treated as not set.
+
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
       <pipeline>/<stage>. Defaults to 3 concurrent runs.
@@ -284,6 +296,150 @@ emit_record() {
   done <<< "$output"
 }
 
+# Shared skeleton for the commands that fan a per-app worker out across a
+# pipeline stage: chunked parallelism, streaming or buffered record emission,
+# table/CSV rendering, and the skipped-apps summary. pipeline-cmd and
+# config-replace differ only in what they do per app, so that part comes in as
+# a worker function name. Worker-specific parameters (the heroku command, the
+# config var, ...) are the calling command's locals, which bash's dynamic
+# scoping keeps visible inside the worker.
+#
+# The worker is called with one argument (the app name), prints the app's
+# record on stdout, and returns non-zero to skip the app: no record is emitted
+# and the app is counted in the stderr summary, rendered as
+# "<count> $skip_summary".
+run_pipeline_workers() {
+  local worker="$1" apps="$2" concurrency="$3" stream="$4" format="$5" skip_summary="$6"
+
+  # Resolve auto -> table on a terminal, CSV when piped. The table's left column
+  # is sized from the (already known) app list, so table output still streams.
+  local render="$format"
+  if [[ "$render" == "auto" ]]; then
+    if [[ -t 1 ]]; then render=table; else render=csv; fi
+  fi
+  local width=7
+  [[ "$render" == "table" ]] && width="$(app_column_width "$apps")"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  # Interpolate $tmpdir into the trap *now*, not at fire time — by the time
+  # the EXIT trap runs, this function has returned and the local is gone.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" EXIT
+  # On an external INT/TERM (cron, a wrapper script, plain `kill`, systemd
+  # stop) the signal reaches only the parent. Without this, the backgrounded
+  # heroku subshells are orphaned and keep running while the EXIT trap deletes
+  # the tmpdir out from under them. Tear the jobs down first, then clean up.
+  # shellcheck disable=SC2064
+  trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$tmpdir'; exit 130" INT TERM
+
+  # Workers drop a marker file here for each app they skip, so the parent can
+  # report a count after they all finish. A dotfile dir, so the --no-stream
+  # collection glob (`$tmpdir/*`) never picks it up.
+  mkdir "$tmpdir/.skipped"
+
+  if [[ "$render" == "table" ]]; then
+    print_table_header "$width"
+  else
+    echo "appname;output"
+  fi
+
+  # Process apps in chunks of $concurrency. Waiting for each chunk to drain
+  # before starting the next caps resource use; running every app in parallel
+  # has swamped laptops on large pipelines.
+  #
+  # The app list is fed in on FD 3 (not stdin) and each backgrounded subshell
+  # has its stdin redirected to /dev/null. Without these two redirections,
+  # heroku/psql in the subshell will happily read from the loop's heredoc
+  # and consume the lines that the next `read` was supposed to see — apps
+  # get skipped and their names get fed to heroku as stray positional args.
+  local in_flight=0 app
+  while IFS= read -r app <&3; do
+    [[ -z "$app" ]] && continue
+    (
+      # The subshell inherits `set -e`. We deliberately turn it off here so a
+      # non-zero exit from heroku inside the worker (e.g. pg:psql against an
+      # app without a DB) is captured into the output column rather than
+      # killing the subshell before it can emit its record.
+      set +e
+      if output="$("$worker" "$app")"; then
+        if [[ "$stream" == "true" ]]; then
+          # Print as soon as this app finishes. Serialize with an atomic mkdir
+          # lock so a record streams out in one piece (emit_record may write
+          # several lines for multi-line/table output) even when apps finish at
+          # the same time; contention is brief. Ignore SIGPIPE so that if the
+          # reader goes away (e.g. `| head`) the writes merely fail instead of
+          # killing the worker mid-record and leaving the lock held; emit_record
+          # breaks on the first failed write so the lock is released promptly.
+          trap '' PIPE
+          while ! mkdir "$tmpdir/.lock" 2>/dev/null; do sleep 0.05; done
+          emit_record "$render" "$width" "$app" "$output"
+          rmdir "$tmpdir/.lock"
+        else
+          # Buffered: store the raw output (filename is the app name) and
+          # format it sorted at the end.
+          printf '%s' "$output" > "$tmpdir/$app"
+        fi
+      else
+        # Non-zero from the worker means "skip this app": record it for the
+        # summary and emit no record.
+        : > "$tmpdir/.skipped/$app"
+      fi
+    ) </dev/null &
+    # Pre-increment so the expression value (and thus exit status) is the
+    # new value — post-increment would return 0 on the first iteration and
+    # trip `set -e`.
+    (( ++in_flight ))
+    if (( in_flight >= concurrency )); then
+      wait || true
+      in_flight=0
+    fi
+  done 3<<< "$apps"
+  wait || true
+
+  # Streaming mode already printed each record. For --no-stream, emit the
+  # buffered per-app rows now, in a stable app-name order. Bash sorts glob
+  # matches and heroku app names contain no whitespace or glob characters, so
+  # iterating the glob is deterministic — unlike `find`, whose order is
+  # filesystem-dependent. The `[[ -f ]]` guard makes the no-match case a no-op
+  # (the glob stays literal when $tmpdir has no app files).
+  if [[ "$stream" != "true" ]]; then
+    local f
+    for f in "$tmpdir"/*; do
+      [[ -f "$f" ]] || continue
+      emit_record "$render" "$width" "${f##*/}" "$(cat "$f")"
+    done
+  fi
+
+  # Report how many apps the workers skipped, on stderr so it never pollutes
+  # the data stream piped from stdout. Separated from the output by a blank
+  # line and rendered dim + italic — but only when stderr is a terminal and
+  # NO_COLOR is unset, so redirected/piped output stays plain text.
+  local skipped
+  skipped="$(find "$tmpdir/.skipped" -type f | wc -l | tr -d ' ')"
+  if (( skipped > 0 )); then
+    local msg="$skipped $skip_summary"
+    if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+      printf '\n\033[2;3m%s\033[0m\n' "$msg" >&2
+    else
+      printf '\n%s\n' "$msg" >&2
+    fi
+  fi
+}
+
+# Per-app worker for pipeline-cmd: run the heroku command and use its combined
+# output as the record. Empty output means the app has nothing to report (e.g.
+# config:get for an unset var), so it is skipped unless -a/--all was passed.
+# $command, $retries, and $include_empty are cmd_pipeline_cmd's locals.
+pipeline_cmd_worker() {
+  local app="$1" output
+  output="$(heroku_for_app_with_retries "$app" "$command" "$retries")"
+  if [[ -z "$output" && "$include_empty" != "true" ]]; then
+    return 1
+  fi
+  printf '%s' "$output"
+}
+
 cmd_pipeline_cmd() {
   [[ $# -ge 3 ]] || die "Usage: $SCRIPT_NAME pipeline-cmd <pipeline> <stage> \"<heroku command>\" [--concurrency=N] [--retries=N] [--no-stream] [-a] [--table|--csv]"
   local pipeline="$1" stage="$2" command="$3"
@@ -323,118 +479,99 @@ cmd_pipeline_cmd() {
   local apps
   apps="$(require_apps "$pipeline" "$stage")" || exit 1
 
-  # Resolve auto -> table on a terminal, CSV when piped. The table's left column
-  # is sized from the (already known) app list, so table output still streams.
-  local render="$format"
-  if [[ "$render" == "auto" ]]; then
-    if [[ -t 1 ]]; then render=table; else render=csv; fi
+  run_pipeline_workers pipeline_cmd_worker "$apps" "$concurrency" "$stream" "$format" \
+    "app(s) with empty output skipped (use -a/--all to include them)"
+}
+
+# Per-app worker for config-replace. Reads the current value with a real argv
+# call — <VAR> and the app are discrete values, so routing them through
+# heroku_for_app's eval would invite word-splitting and glob expansion — and
+# only writes when it is exactly $old_value. $var, $old_value, $new_value,
+# $dry_run, and $include_unset are cmd_config_replace's locals.
+config_replace_worker() {
+  local app="$1" current status
+  # Capture config:get's raw output and exit status before filtering — piping
+  # straight into strip_heroku_noise (which ends in `|| true`) would lose the
+  # status. A failed lookup (no access, app gone) must never have its error
+  # text compared against <old-value>: in the pathological case a matching
+  # message would authorize a write to an app whose value was never read.
+  current="$(heroku config:get "$var" -a "$app" 2>&1)"
+  status=$?
+  current="$(strip_heroku_noise <<< "$current")"
+  if (( status != 0 )); then
+    printf 'error: %s' "$current"
+    return 0
   fi
-  local width=7
-  [[ "$render" == "table" ]] && width="$(app_column_width "$apps")"
-
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  # Interpolate $tmpdir into the trap *now*, not at fire time — by the time
-  # the EXIT trap runs, this function has returned and the local is gone.
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmpdir'" EXIT
-  # On an external INT/TERM (cron, a wrapper script, plain `kill`, systemd
-  # stop) the signal reaches only the parent. Without this, the backgrounded
-  # heroku subshells are orphaned and keep running while the EXIT trap deletes
-  # the tmpdir out from under them. Tear the jobs down first, then clean up.
-  # shellcheck disable=SC2064
-  trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$tmpdir'; exit 130" INT TERM
-
-  # Workers drop a marker file here for each app skipped due to empty output, so
-  # the parent can report a count after they all finish. A dotfile dir, so the
-  # --no-stream collection glob (`$tmpdir/*`) never picks it up.
-  mkdir "$tmpdir/.skipped"
-
-  if [[ "$render" == "table" ]]; then
-    print_table_header "$width"
-  else
-    echo "appname;output"
-  fi
-
-  # Process apps in chunks of $concurrency. Waiting for each chunk to drain
-  # before starting the next caps resource use; running every app in parallel
-  # has swamped laptops on large pipelines.
-  #
-  # The app list is fed in on FD 3 (not stdin) and each backgrounded subshell
-  # has its stdin redirected to /dev/null. Without these two redirections,
-  # heroku/psql in the subshell will happily read from the loop's heredoc
-  # and consume the lines that the next `read` was supposed to see — apps
-  # get skipped and their names get fed to heroku as stray positional args.
-  local in_flight=0
-  while IFS= read -r app <&3; do
-    [[ -z "$app" ]] && continue
-    (
-      # The subshell inherits `set -e`. We deliberately turn it off here so a
-      # non-zero exit from heroku (e.g. pg:psql against an app without a DB)
-      # is captured into the output column rather than killing the subshell
-      # before it can emit its record.
-      set +e
-      output="$(heroku_for_app_with_retries "$app" "$command" "$retries")"
-      if [[ -z "$output" && "$include_empty" != "true" ]]; then
-        # Empty output: record the skip for the summary and emit no record.
-        : > "$tmpdir/.skipped/$app"
-      elif [[ "$stream" == "true" ]]; then
-        # Print as soon as this app finishes. Serialize with an atomic mkdir
-        # lock so a record streams out in one piece (emit_record may write
-        # several lines for multi-line/table output) even when apps finish at
-        # the same time; contention is brief. Ignore SIGPIPE so that if the
-        # reader goes away (e.g. `| head`) the writes merely fail instead of
-        # killing the worker mid-record and leaving the lock held; emit_record
-        # breaks on the first failed write so the lock is released promptly.
-        trap '' PIPE
-        while ! mkdir "$tmpdir/.lock" 2>/dev/null; do sleep 0.05; done
-        emit_record "$render" "$width" "$app" "$output"
-        rmdir "$tmpdir/.lock"
-      else
-        # Buffered: store the raw output (filename is the app name) and format
-        # it sorted at the end.
-        printf '%s' "$output" > "$tmpdir/$app"
-      fi
-    ) </dev/null &
-    # Pre-increment so the expression value (and thus exit status) is the
-    # new value — post-increment would return 0 on the first iteration and
-    # trip `set -e`.
-    (( ++in_flight ))
-    if (( in_flight >= concurrency )); then
-      wait || true
-      in_flight=0
+  # config:get prints an empty line when the var is unset — and also when it
+  # is set to the empty string; its output cannot tell the two apart, so an
+  # empty-string value is treated as not set. The command substitution
+  # collapses that line to an empty string.
+  if [[ -z "$current" ]]; then
+    if [[ "$include_unset" == "true" ]]; then
+      printf 'skipped: %s not set' "$var"
+      return 0
     fi
-  done 3<<< "$apps"
-  wait || true
+    return 1
+  fi
+  if [[ "$current" != "$old_value" ]]; then
+    # A different value is left alone, but visibly: a silent skip would hide
+    # apps that have drifted from the value the operator expected.
+    printf 'skipped: %s is "%s" (expected "%s")' "$var" "$current" "$old_value"
+    return 0
+  fi
+  if [[ "$dry_run" == "true" ]]; then
+    printf 'would set %s=%s (currently %s)' "$var" "$new_value" "$old_value"
+    return 0
+  fi
+  # argv form, never eval: the new value may contain spaces or shell
+  # metacharacters and must reach heroku as one word. Captured first rather
+  # than piped straight into strip_heroku_noise: under pipefail a failed
+  # config:set would make the pipeline — and so this worker — return non-zero,
+  # which the runner counts as a skip, silently misreporting a failed write as
+  # "var not set". Success or failure, the combined output is the record.
+  local result
+  result="$(heroku config:set "$var=$new_value" -a "$app" 2>&1)"
+  strip_heroku_noise <<< "$result"
+}
 
-  # Streaming mode already printed each record. For --no-stream, emit the
-  # buffered per-app rows now, in a stable app-name order. Bash sorts glob
-  # matches and heroku app names contain no whitespace or glob characters, so
-  # iterating the glob is deterministic — unlike `find`, whose order is
-  # filesystem-dependent. The `[[ -f ]]` guard makes the no-match case a no-op
-  # (the glob stays literal when $tmpdir has no app files).
-  if [[ "$stream" != "true" ]]; then
-    local f
-    for f in "$tmpdir"/*; do
-      [[ -f "$f" ]] || continue
-      emit_record "$render" "$width" "${f##*/}" "$(cat "$f")"
-    done
+cmd_config_replace() {
+  [[ $# -ge 5 ]] || die "Usage: $SCRIPT_NAME config-replace <pipeline> <stage> <VAR> <old-value> <new-value> [--concurrency=N] [--dry-run] [-a|--all] [--table|--csv] [--no-stream]"
+  local pipeline="$1" stage="$2" var="$3" old_value="$4" new_value="$5"
+  shift 5
+
+  # Same flag surface as pipeline-cmd, plus --dry-run (read every current
+  # value, write nothing). -a/--all here means "include apps that don't have
+  # <VAR> set", recording them as "skipped: <VAR> not set" instead of omitting
+  # them.
+  local stream=true include_unset=false format=auto dry_run=false
+  local -a opts=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stream) stream=true;;
+      --no-stream) stream=false;;
+      -a|--all) include_unset=true;;
+      --table) format=table;;
+      --csv) format=csv;;
+      --dry-run) dry_run=true;;
+      *) opts+=("$1");;
+    esac
+    shift
+  done
+
+  local concurrency=3
+  if [[ ${#opts[@]} -gt 0 ]]; then
+    concurrency="$(parse_concurrency "${opts[@]}")" || exit 1
   fi
 
-  # Report how many apps were skipped for empty output, on stderr so it never
-  # pollutes the data stream piped from stdout. Separated from the output by a
-  # blank line and rendered dim + italic — but only when stderr is a terminal
-  # and NO_COLOR is unset, so redirected/piped output stays plain text.
-  local skipped
-  skipped="$(find "$tmpdir/.skipped" -type f | wc -l | tr -d ' ')"
-  if (( skipped > 0 )); then
-    local msg="$skipped app(s) with empty output skipped (use -a/--all to include them)"
-    if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
-      printf '\n\033[2;3m%s\033[0m\n' "$msg" >&2
-    else
-      printf '\n%s\n' "$msg" >&2
-    fi
-  fi
+  # A dry run still reads every app's current value via config:get, so it
+  # needs credentials just like a real run.
+  resolve_heroku_api_key
+
+  local apps
+  apps="$(require_apps "$pipeline" "$stage")" || exit 1
+
+  run_pipeline_workers config_replace_worker "$apps" "$concurrency" "$stream" "$format" \
+    "app(s) without $var skipped (use -a/--all to include them)"
 }
 
 cmd_pipeline_task() {
@@ -542,6 +679,9 @@ main() {
       ;;
     pipeline-cmd)
       cmd_pipeline_cmd "$@"
+      ;;
+    config-replace)
+      cmd_config_replace "$@"
       ;;
     pipeline-task)
       cmd_pipeline_task "$@"

@@ -68,6 +68,7 @@ HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my
 ```sh
 heroku-scripts apps <pipeline> <stage>
 heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--retries=N] [--no-stream] [-a] [--table|--csv]
+heroku-scripts config-replace <pipeline> <stage> <VAR> <old-value> <new-value> [--concurrency=N] [--dry-run] [-a|--all] [--table|--csv] [--no-stream]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 ```
@@ -145,6 +146,39 @@ last error as its record. The default is `--retries=0` (unchanged behavior).
 
 One caveat: a mid-session drop can happen *after* the remote command started
 running, so only use `--retries` with commands that are safe to run twice.
+
+### Replace a config var's value across a stage, only where it currently matches
+
+`config-replace` is a guarded `config:set`: it reads each app's current value
+first and only writes on apps where that value is exactly the one you expect.
+
+```sh
+heroku-scripts config-replace my-pipe production SMTP_HOST smtp.old.example smtp.new.example
+```
+
+Apps that don't have the var at all are skipped (with a count on stderr, or a
+`skipped: SMTP_HOST not set` record when you pass `-a`/`--all`), and apps whose
+value is something else entirely are left untouched but reported, so drift
+stays visible. One blind spot: `config:get` prints the same empty line for an
+unset var and one set to the empty string, so a var set to `""` is treated as
+not set.
+
+```
+appname;output
+my-app;SMTP_HOST: smtp.new.example
+my-app-worker;skipped: SMTP_HOST is "smtp.other.example" (expected "smtp.old.example")
+```
+
+Pass `--dry-run` to see what would change without setting anything — it still
+reads every app's current value, so it needs credentials like a real run:
+
+```sh
+heroku-scripts config-replace my-pipe production SMTP_HOST smtp.old.example smtp.new.example --dry-run
+# my-app;would set SMTP_HOST=smtp.new.example (currently smtp.old.example)
+```
+
+`--concurrency`, `--no-stream`, and `--table`/`--csv` behave exactly as in
+`pipeline-cmd`.
 
 Run a mix task on every production app, four at a time:
 
