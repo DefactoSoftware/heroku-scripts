@@ -197,6 +197,147 @@ STUB
   [[ "$output" == *"No apps found"* ]]
 }
 
+# heroku stub for config-replace: serves per-app config:get values (with
+# spaces, to prove values survive as single argv words) and logs every
+# config:set argv to ./set-calls (workers inherit the test's cwd), so tests
+# can assert the exact call shape — or that no call happened at all.
+_heroku_stub_config_values() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-match        staging\napp-unset        staging\napp-differs        staging\n' "$2"; exit 0
+fi
+app=""; prev=""
+for a in "$@"; do [[ "$prev" == "-a" ]] && app="$a"; prev="$a"; done
+if [[ "$1" == "config:get" ]]; then
+  # Real config:get prints an empty line when the var is unset.
+  case "$app" in
+    app-match)   echo "old value";;
+    app-differs) echo "other value";;
+    app-unset)   echo "";;
+  esac
+  exit 0
+fi
+if [[ "$1" == "config:set" ]]; then
+  { printf 'SET'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> ./set-calls
+  echo "set-done-$app"
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 1
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "config-replace sets the var where the value matches and uses config:set output as the record" {
+  _heroku_stub_config_values
+  run --separate-stderr "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-match;set-done-app-match"* ]]
+}
+
+@test "config-replace passes VAR=value and -a app to config:set as separate argv words" {
+  _heroku_stub_config_values
+  run "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value"
+  [ "$status" -eq 0 ]
+  # Exactly one config:set, with the space-containing value as ONE word.
+  [ "$(wc -l < set-calls | tr -d ' ')" = "1" ]
+  grep -qF "SET [config:set] [MY_VAR=new value] [-a] [app-match]" set-calls
+}
+
+@test "config-replace skips apps without the var and reports a count on stderr" {
+  _heroku_stub_config_values
+  # File capture rather than `run`, matching the empty-output test above.
+  "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value" >stdout.txt 2>stderr.txt
+  ! grep -q "app-unset" stdout.txt
+  [ -z "$(head -n 1 stderr.txt)" ]
+  grep -q "1 app(s) without MY_VAR skipped" stderr.txt
+  grep -q -- "-a/--all" stderr.txt
+}
+
+@test "config-replace -a includes unset apps with a not-set record" {
+  _heroku_stub_config_values
+  run --separate-stderr "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value" -a
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-unset;skipped: MY_VAR not set"* ]]
+  [[ "$stderr" != *"skipped"* ]]
+}
+
+@test "config-replace leaves a different value alone and emits a mismatch record" {
+  _heroku_stub_config_values
+  run "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'app-differs;skipped: MY_VAR is "other value" (expected "old value")'* ]]
+  ! grep -q "app-differs" set-calls
+}
+
+@test "config-replace --dry-run reports would-set records and never calls config:set" {
+  _heroku_stub_config_values
+  run "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-match;would set MY_VAR=new value (currently old value)"* ]]
+  # The stub logs every config:set; the file never existing proves none ran.
+  [ ! -e set-calls ]
+}
+
+@test "config-replace rejects the wrong argument count" {
+  run "$SCRIPT" config-replace mypipe staging MY_VAR "old value"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage:"* ]]
+}
+
+@test "config-replace rejects a non-positive concurrency" {
+  run "$SCRIPT" config-replace mypipe staging MY_VAR old new --concurrency=0
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"positive integer"* ]]
+}
+
+@test "config-replace surfaces a failed config:get as an error record and never writes" {
+  # A failed lookup must not have its error text compared against <old-value> —
+  # here the message IS the old value, the worst case for that comparison.
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-geterr        staging\n' "$2"; exit 0
+fi
+if [[ "$1" == "config:get" ]]; then
+  echo "old value" >&2
+  exit 1
+fi
+if [[ "$1" == "config:set" ]]; then
+  : >> ./set-calls
+  exit 0
+fi
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+  run "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-geterr;error: old value"* ]]
+  [ ! -e set-calls ]
+}
+
+@test "config-replace surfaces a failed config:set as the app's record, not a skip" {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\napp-match        staging\n' "$2"; exit 0
+fi
+if [[ "$1" == "config:get" ]]; then
+  echo "old value"
+  exit 0
+fi
+if [[ "$1" == "config:set" ]]; then
+  echo "Boom: rate limited" >&2
+  exit 1
+fi
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+  run --separate-stderr "$SCRIPT" config-replace mypipe staging MY_VAR "old value" "new value"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"app-match;Boom: rate limited"* ]]
+  [[ "$stderr" != *"skipped"* ]]
+}
+
 @test "promote --dry-run prints commands without running or prompting" {
   run "$SCRIPT" promote my-app team pipe --dry-run
   [ "$status" -eq 0 ]
