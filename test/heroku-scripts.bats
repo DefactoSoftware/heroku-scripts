@@ -489,6 +489,201 @@ STUB
   [[ "$output" == *"non-negative integer"* ]]
 }
 
+# Writes a curl stub that speaks deploy-slug's platform-API dialect: it
+# answers GETs from the case table passed in $1 (a chunk of shell script),
+# and logs every POST — method, path, bearer token, body — to ./api-calls so
+# tests can assert the exact release call, or that none happened. The real
+# heroku_api asks curl for the HTTP status on a trailing line (-w), so every
+# reply here ends in one.
+_curl_stub_platform_api() {
+  cat > "$TESTDIR/bin/curl" <<STUB
+#!/usr/bin/env bash
+method=GET; url=""; body=""; auth=""; prev=""
+for a in "\$@"; do
+  case "\$prev" in
+    -X) method="\$a";;
+    -d) body="\$a";;
+    -H) [[ "\$a" == "Authorization: Bearer "* ]] && auth="\${a#Authorization: Bearer }";;
+  esac
+  [[ "\$a" == https://* ]] && url="\$a"
+  prev="\$a"
+done
+path="\${url#https://api.heroku.com}"
+if [[ "\$method" == "GET" ]]; then
+  case "\$path" in
+$1
+    *) printf '{}';;
+  esac
+  printf '\n200'
+  exit 0
+fi
+if [[ "\$method" == "POST" ]]; then
+  printf '%s [%s] [%s] [%s]\n' "\$method" "\$path" "\$auth" "\$body" >> ./api-calls
+  printf '{"version": 8, "status": "pending"}\n201'
+  exit 0
+fi
+echo "unexpected curl: \$*" >&2
+exit 1
+STUB
+  chmod +x "$TESTDIR/bin/curl"
+}
+
+# heroku stub for deploy-slug's --from path: serves releases --json per app
+# (app-src's newest release carries no slug, so the slug must come from the
+# newest release that does) plus auth:token, with the platform API stubbed
+# via _curl_stub_platform_api.
+_heroku_stub_slug_api() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth:token" ]]; then
+  echo "test-token"
+  exit 0
+fi
+app=""; prev=""
+for a in "$@"; do [[ "$prev" == "-a" ]] && app="$a"; prev="$a"; done
+if [[ "$1" == "releases" ]]; then
+  case "$app" in
+    app-src)
+      # Ascending on purpose: v41 carries a different slug, so an
+      # implementation that takes the first (or first slug-carrying) entry
+      # instead of the newest one fails the assertion on the request body.
+      echo '[{"version": 41, "slug": {"id": "slug-older"}},
+             {"version": 42, "slug": {"id": "slug-src"}},
+             {"version": 43, "slug": null}]';;
+    app-target)
+      echo '[{"version": 7, "slug": {"id": "slug-old"}}]';;
+    app-empty)
+      echo '[]';;
+    *) echo "Couldn't find that app." >&2; exit 1;;
+  esac
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 1
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+  _curl_stub_platform_api '    /apps/app-src/slugs/slug-src)
+      printf '\''{"created_at":"2026-08-20T09:59:00Z","commit":"abcdef1234567890","commit_description":"Fix the thing"}'\'';;'
+}
+
+@test "deploy-slug --from releases the source's newest slug-carrying release to the target" {
+  _heroku_stub_slug_api
+  run "$SCRIPT" deploy-slug app-target --from=app-src --yes
+  [ "$status" -eq 0 ]
+  # The preview names the source release and the slug's commit.
+  [[ "$output" == *"from:    app-src (v42)"* ]]
+  [[ "$output" == *"commit:  abcdef12 (Fix the thing)"* ]]
+  [[ "$output" == *"Released v8 on app-target (status: pending)"* ]]
+  # Exactly one release call, authenticated with the CLI's token, body built
+  # from the slug id and provenance.
+  [ "$(wc -l < api-calls | tr -d ' ')" = "1" ]
+  grep -qF 'POST [/apps/app-target/releases] [test-token] [{"slug":"slug-src","description":"Deploy abcdef12 (slug from app-src)"}]' api-calls
+}
+
+@test "deploy-slug --dry-run prints the release call without posting or prompting" {
+  _heroku_stub_slug_api
+  run "$SCRIPT" deploy-slug app-target --from=app-src --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"would call: POST https://api.heroku.com/apps/app-target/releases with body"* ]]
+  # The curl stub logs every POST; the file never existing proves none ran.
+  [ ! -e api-calls ]
+}
+
+@test "deploy-slug aborts when the prompt is declined" {
+  _heroku_stub_slug_api
+  run "$SCRIPT" deploy-slug app-target --from=app-src <<< "n"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Aborted."* ]]
+  [ ! -e api-calls ]
+}
+
+@test "deploy-slug fails when the source has no slug-carrying release" {
+  _heroku_stub_slug_api
+  run "$SCRIPT" deploy-slug app-target --from=app-empty --yes
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"No slug-carrying release found on app-empty"* ]]
+  [ ! -e api-calls ]
+}
+
+@test "deploy-slug fails before the prompt when the target cannot be read" {
+  _heroku_stub_slug_api
+  run "$SCRIPT" deploy-slug app-gone --from=app-src
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Couldn't find that app."* ]]
+  [[ "$output" != *"Proceed?"* ]]
+  [ ! -e api-calls ]
+}
+
+@test "deploy-slug rejects the same app as source and target" {
+  run "$SCRIPT" deploy-slug app-src --from=app-src
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Source and target are the same app"* ]]
+}
+
+@test "deploy-slug rejects an app name that could rewrite the API path" {
+  run "$SCRIPT" deploy-slug 'evil/../other'
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Invalid app name"* ]]
+}
+
+@test "deploy-slug rejects an empty --from= instead of falling back to the scan" {
+  run "$SCRIPT" deploy-slug app-target --from=
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"--from requires an app name"* ]]
+}
+
+@test "deploy-slug rejects the wrong argument count" {
+  run "$SCRIPT" deploy-slug
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Usage:"* ]]
+}
+
+# heroku stub for deploy-slug's no---from path: `apps --all` lists detroit and
+# non-detroit apps. detroit-stale has the NEWER release (v900, a config change)
+# but its slug was built weeks before detroit-fresh's, so ranking by slug build
+# time must pick detroit-fresh's slug.
+_heroku_stub_detroit_scan() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "auth:token" ]]; then
+  echo "test-token"
+  exit 0
+fi
+if [[ "$1" == "apps" ]]; then
+  printf '=== Team Apps\ndetroit-fresh (eu)\ndetroit-stale (eu)\nother-app (eu)\n'
+  exit 0
+fi
+app=""; prev=""
+for a in "$@"; do [[ "$prev" == "-a" ]] && app="$a"; prev="$a"; done
+if [[ "$1" == "releases" ]]; then
+  case "$app" in
+    detroit-stale) echo '[{"version": 900, "slug": {"id": "slug-old"}}]';;
+    detroit-fresh) echo '[{"version": 100, "slug": {"id": "slug-new"}}]';;
+    my-target)     echo '[]';;
+    *) echo "Couldn't find that app." >&2; exit 1;;
+  esac
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 1
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+  _curl_stub_platform_api '    /apps/detroit-stale/slugs/slug-old)
+      printf '\''{"created_at":"2026-08-01T00:00:00Z","commit":"aaaa111122223333","commit_description":"Deploy aaaa1111"}'\'';;
+    /apps/detroit-fresh/slugs/slug-new)
+      printf '\''{"created_at":"2026-08-21T00:00:00Z","commit":"bbbb444455556666","commit_description":"Deploy bbbb4444"}'\'';;'
+}
+
+@test "deploy-slug without --from picks the most recently built detroit slug, not the newest release" {
+  _heroku_stub_detroit_scan
+  run "$SCRIPT" deploy-slug my-target --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"from:    detroit-fresh (v100)"* ]]
+  [[ "$output" == *"to:      my-target (currently no slug-carrying release yet)"* ]]
+  grep -qF '"slug":"slug-new"' api-calls
+  ! grep -q "slug-old" api-calls
+}
+
 @test "HEROKU_SCRIPTS_OP_REF set but op missing fails clearly" {
   # Restricted PATH: the heroku stub + coreutils, but no `op` anywhere.
   PATH="$TESTDIR/bin:/usr/bin:/bin:/usr/sbin:/sbin" \

@@ -62,13 +62,24 @@ Commands:
       destructive, largely irreversible operations). --dry-run prints the
       heroku commands without running them; --yes skips the prompt.
 
+  deploy-slug <target-app> [--from=<source-app>] [--dry-run] [--yes]
+      Release an already-built slug to <target-app> — a deploy without a
+      build, the same mechanism the CI slug pipeline uses. With --from,
+      the slug is the one <source-app> is currently running. Without
+      --from, every detroit-* app is scanned and the most recently BUILT
+      slug wins (so a config change on a stale app cannot shadow a real
+      deploy). Prompts for confirmation first; --dry-run prints the
+      release call without running it, --yes skips the prompt.
+      Requires \`jq\`.
+
   help, --help, -h
       Show this help.
 
   version, --version, -V
       Print the script version.
 
-Requires the \`heroku\` CLI to be installed and authenticated.
+Requires the \`heroku\` CLI to be installed and authenticated;
+deploy-slug also needs \`jq\`.
 
 Authentication:
   Uses HEROKU_API_KEY if set. Otherwise, if HEROKU_SCRIPTS_OP_REF holds a
@@ -664,6 +675,314 @@ cmd_promote() {
   heroku_argv pipelines:add "$pipeline" -s production -a "$app"
 }
 
+# Resolves the Platform API bearer token for deploy-slug's direct API calls:
+# HEROKU_API_KEY when set (possibly just resolved from 1Password by
+# resolve_heroku_api_key), otherwise whatever token the heroku CLI itself is
+# logged in with. Cached in HEROKU_SCRIPTS_API_TOKEN so auth:token — which
+# takes a second or two — runs at most once.
+resolve_heroku_api_token() {
+  [[ -n "${HEROKU_SCRIPTS_API_TOKEN:-}" ]] && return 0
+  if [[ -n "${HEROKU_API_KEY:-}" ]]; then
+    HEROKU_SCRIPTS_API_TOKEN="$HEROKU_API_KEY"
+    return 0
+  fi
+  HEROKU_SCRIPTS_API_TOKEN="$(heroku auth:token 2> >(strip_heroku_noise >&2))" \
+    || die "Could not get a Heroku API token (is the heroku CLI logged in?)"
+  [[ -n "$HEROKU_SCRIPTS_API_TOKEN" ]] || die "heroku auth:token returned an empty token"
+}
+
+# Runs one call against the Heroku Platform API and prints the JSON response
+# on stdout. The heroku CLI has no porcelain for slugs or for creating a
+# release from an existing one (its \`api\` plugin is not installed by
+# default), so deploy-slug talks to the platform API directly — the same
+# calls the detroit CI release workflow makes — using the CLI's own token.
+#
+# A non-2xx response prints the error body on stderr and returns 1. The HTTP
+# status rides out of curl on the last line (-w), so API errors and genuine
+# transport errors (curl itself non-zero) both surface as failures.
+#
+# Honors $DRY_RUN for non-GET methods: prints what it would call instead of
+# calling. GETs still run, because a dry run needs the reads.
+heroku_api() {
+  local method="$1" path="$2" body="${3:-}"
+
+  if [[ "${DRY_RUN:-}" == "true" && "$method" != "GET" ]]; then
+    if [[ -n "$body" ]]; then
+      printf 'would call: %s https://api.heroku.com%s with body %s\n' "$method" "$path" "$body"
+    else
+      printf 'would call: %s https://api.heroku.com%s\n' "$method" "$path"
+    fi
+    return 0
+  fi
+
+  local -a args=(-sS -X "$method"
+    -H 'Accept: application/vnd.heroku+json; version=3'
+    -H "Authorization: Bearer ${HEROKU_SCRIPTS_API_TOKEN}"
+    -w $'\n%{http_code}')
+  if [[ -n "$body" ]]; then
+    args+=(-H 'Content-Type: application/json' -d "$body")
+  fi
+
+  local response
+  response="$(curl "${args[@]}" "https://api.heroku.com$path")" || return 1
+  local status="${response##*$'\n'}"
+  local payload="${response%$'\n'*}"
+  if [[ "$status" != 2?? ]]; then
+    printf '%s\n' "$payload" >&2
+    return 1
+  fi
+  printf '%s\n' "$payload"
+}
+
+# Prints "<slug-id>|<release-version>" for the newest release of <app> that
+# carries a slug, or nothing when no release does (e.g. a freshly created
+# app). Config-var changes and rollbacks create new releases that reuse an
+# existing slug, so the newest slug-carrying release is what the app is
+# currently *running*, not just its last code deploy. heroku's stderr
+# (banners, error text) is filtered and passed through, so a failed lookup
+# surfaces its own message; stdout stays pure JSON for jq. Returns non-zero
+# only when the release list itself cannot be read, letting callers tell
+# "no slug yet" (empty output) from "no such app / no access" (failure).
+current_slug() {
+  local app="$1" json
+  json="$(heroku releases -a "$app" --json 2> >(strip_heroku_noise >&2))" \
+    || return 1
+  jq -r 'map(select(.slug != null)) | sort_by(.version) | last // empty
+    | "\(.slug.id)|\(.version)"' <<< "$json"
+}
+
+# Prints "<created-at>|<commit>|<commit-description>" for one of <app>'s
+# slugs, via the platform API (there is no slugs porcelain in the heroku
+# CLI). The commit fields may be empty; the description comes last so
+# callers can IFS-split the line safely, and embedded newlines are flattened
+# to spaces to keep the one-line protocol.
+slug_info() {
+  local app="$1" slug="$2" json
+  json="$(heroku_api GET "/apps/$app/slugs/$slug")" || return 1
+  jq -r '"\(.created_at)|\(.commit // "")|\((.commit_description // "") | gsub("[\\n\\r]"; " "))"' \
+    <<< "$json"
+}
+
+# Finds the slug to deploy when no --from app is given: the one most recently
+# BUILT among the slugs currently running on detroit-* apps. Prints
+# "<app>|<slug-id>|<release-version>" naming the app that carries it.
+#
+# Ranking by slug creation time — not release time — matters: some detroit
+# apps opt out of auto deploys (e.g. detroit-demo's staging lane), so a mere
+# config:set on a stale app creates a *newer release* of *older code*, which
+# a latest-release comparison would wrongly pick. The CI builds one slug and
+# releases it everywhere, so most apps share a slug; the API is asked for
+# each unique slug's build time only once.
+latest_detroit_slug() {
+  # This function runs inside a `|| exit`-guarded command substitution, which
+  # disables errexit throughout — so the failures that matter are checked
+  # explicitly. A failed apps listing must not be scanned: pipefail makes the
+  # substitution report it, but heroku may already have printed a partial
+  # list, and picking a slug from incomplete data could deploy the wrong one.
+  local apps
+  if ! apps="$(NO_COLOR=1 heroku apps --all 2> >(strip_heroku_noise >&2) \
+    | sed -E $'s/\x1b\\[[0-9;]*m//g' \
+    | awk '$1 ~ /^detroit-/ { print $1 }')"; then
+    echo "Could not list Heroku apps" >&2
+    return 1
+  fi
+  if [[ -z "$apps" ]]; then
+    echo "No detroit-* apps visible to this Heroku account" >&2
+    return 1
+  fi
+
+  echo "Reading the current slug of $(wc -l <<< "$apps" | tr -d ' ') detroit-* apps..." >&2
+
+  # Checked for the same errexit-is-off reason: an empty $tmpdir would send
+  # the workers' redirections to /<app> and the collection glob to /*.
+  local tmpdir
+  tmpdir="$(mktemp -d)" || return 1
+  # Interpolate $tmpdir now, not at fire time — same reasoning as in
+  # run_pipeline_workers.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmpdir'" EXIT
+  # Tear the backgrounded lookups down before cleanup on an external
+  # INT/TERM, exactly as in run_pipeline_workers.
+  # shellcheck disable=SC2064
+  trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$tmpdir'; exit 130" INT TERM
+
+  # Chunks of 5, stdin detached and the app list on FD 3 — the same
+  # precautions as run_pipeline_workers, for the same reasons. Apps whose
+  # releases cannot be read (no access, mid-provision) are left out of the
+  # ranking rather than failing the whole scan.
+  local in_flight=0 app
+  while IFS= read -r app <&3; do
+    [[ -z "$app" ]] && continue
+    (
+      set +e
+      line="$(current_slug "$app" 2>/dev/null)"
+      [[ -n "$line" ]] && printf '%s|%s\n' "$app" "$line" > "$tmpdir/$app"
+    ) </dev/null &
+    (( ++in_flight ))
+    if (( in_flight >= 5 )); then
+      wait || true
+      in_flight=0
+    fi
+  done 3<<< "$apps"
+  wait || true
+
+  # One representative "app|slug|version" line per unique slug id (field 2).
+  local unique
+  unique="$(cat "$tmpdir"/* 2>/dev/null | sort -t'|' -k2,2 -u)"
+  if [[ -z "$unique" ]]; then
+    echo "Could not read a current slug from any detroit-* app" >&2
+    return 1
+  fi
+
+  local ranked="" slug version info
+  while IFS='|' read -r app slug version; do
+    info="$(slug_info "$app" "$slug")" || continue
+    ranked+="${info%%|*}|${app}|${slug}|${version}"$'\n'
+  done <<< "$unique"
+  if [[ -z "$ranked" ]]; then
+    echo "Could not fetch slug details for any detroit-* app" >&2
+    return 1
+  fi
+
+  # created-at is ISO 8601 UTC, so a plain lexicographic comparison ranks by
+  # build time. Selected in bash rather than `sort | head`, which under
+  # pipefail can report SIGPIPE (head exiting early) as a failure.
+  local best="" entry
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" > "$best" ]]; then
+      best="$entry"
+    fi
+  done <<< "$ranked"
+  printf '%s\n' "${best#*|}"
+}
+
+cmd_deploy_slug() {
+  local DRY_RUN=false assume_yes=false from_app=""
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from=*)
+        from_app="${1#*=}"
+        # An empty --from= must not silently fall back to the detroit scan.
+        [[ -n "$from_app" ]] || die "--from requires an app name";;
+      --dry-run) DRY_RUN=true;;
+      --yes|-y) assume_yes=true;;
+      --) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done; break;;
+      -*) die "Unknown option: $1";;
+      *) positional+=("$1");;
+    esac
+    shift
+  done
+
+  if [[ ${#positional[@]} -ne 1 ]]; then
+    die "Usage: $SCRIPT_NAME deploy-slug <target-app> [--from=<source-app>] [--dry-run] [--yes]"
+  fi
+  local target_app="${positional[0]}"
+
+  # These names end up inside an API URL path (heroku api POST /apps/<app>/…)
+  # rather than behind an -a flag, so reject anything that could rewrite the
+  # path.
+  [[ "$target_app" =~ ^[a-z0-9-]+$ ]] || die "Invalid app name: $target_app"
+  if [[ -n "$from_app" ]]; then
+    [[ "$from_app" =~ ^[a-z0-9-]+$ ]] || die "Invalid app name: $from_app"
+    [[ "$from_app" != "$target_app" ]] || die "Source and target are the same app: $target_app"
+  fi
+
+  command -v jq >/dev/null 2>&1 || die "deploy-slug requires jq (https://jqlang.org)"
+
+  # Even a dry run reads releases and slug metadata, so it needs credentials —
+  # both the CLI's (for `heroku releases`) and a bearer token for the direct
+  # platform API calls.
+  resolve_heroku_api_key
+  resolve_heroku_api_token
+
+  local source_app slug_id source_version line
+  if [[ -n "$from_app" ]]; then
+    source_app="$from_app"
+    line="$(current_slug "$source_app")" || exit 1
+    [[ -n "$line" ]] || die "No slug-carrying release found on $source_app"
+    slug_id="${line%%|*}"
+    source_version="${line#*|}"
+  else
+    line="$(latest_detroit_slug)" || exit 1
+    IFS='|' read -r source_app slug_id source_version <<< "$line"
+  fi
+
+  local info slug_created slug_commit slug_description
+  info="$(slug_info "$source_app" "$slug_id")" || exit 1
+  IFS='|' read -r slug_created slug_commit slug_description <<< "$info"
+
+  # Read the target's current slug up front: it verifies the target exists
+  # before the operator confirms anything, and lets the preview flag a
+  # same-slug release (harmless, but it restarts dynos for no code change).
+  local target_line target_note
+  target_line="$(current_slug "$target_app")" || exit 1
+  if [[ -z "$target_line" ]]; then
+    target_note="no slug-carrying release yet"
+  elif [[ "${target_line%%|*}" == "$slug_id" ]]; then
+    target_note="v${target_line#*|}, ALREADY running this slug"
+  else
+    target_note="v${target_line#*|}"
+  fi
+
+  {
+    echo "About to release a slug:"
+    echo "  slug:    $slug_id"
+    if [[ -n "$slug_commit" ]]; then
+      echo "  commit:  ${slug_commit:0:8} ($slug_description)"
+    fi
+    echo "  built:   $slug_created"
+    echo "  from:    $source_app (v$source_version)"
+    echo "  to:      $target_app (currently $target_note)"
+    echo
+    echo "This creates a new release on '$target_app' running that slug's code"
+    echo "and restarts its dynos."
+    echo
+  } >&2
+
+  if [[ "$DRY_RUN" != "true" && "$assume_yes" != "true" ]]; then
+    local reply
+    read -r -p "Proceed? [y/N] " reply || reply=""
+    case "$reply" in
+      y|Y|yes|Yes|YES) ;;
+      *) echo "Aborted." >&2; exit 1;;
+    esac
+  fi
+
+  local release_description
+  if [[ -n "$slug_commit" ]]; then
+    release_description="Deploy ${slug_commit:0:8} (slug from $source_app)"
+  else
+    release_description="Slug from $source_app"
+  fi
+  # jq builds the request body so the description survives JSON escaping.
+  local payload
+  payload="$(jq -cn --arg slug "$slug_id" --arg description "$release_description" \
+    '{slug: $slug, description: $description}')"
+
+  echo "Releasing slug to $target_app..."
+  # Captured rather than streamed: on failure the API's error text becomes
+  # the die message, on success the response yields the new release number.
+  local response
+  if ! response="$(heroku_api POST "/apps/$target_app/releases" "$payload" 2>&1)"; then
+    die "Release failed on $target_app: $response"
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    # heroku_api printed the would-call line instead of releasing anything.
+    printf '%s\n' "$response"
+    return 0
+  fi
+  local new_version release_status
+  new_version="$(jq -r '.version // empty' <<< "$response" 2>/dev/null || true)"
+  release_status="$(jq -r '.status // empty' <<< "$response" 2>/dev/null || true)"
+  if [[ -n "$new_version" ]]; then
+    echo "Released v$new_version on $target_app (status: ${release_status:-unknown})"
+  else
+    printf '%s\n' "$response"
+  fi
+}
+
 main() {
   if [[ $# -eq 0 ]]; then
     usage
@@ -688,6 +1007,9 @@ main() {
       ;;
     promote)
       cmd_promote "$@"
+      ;;
+    deploy-slug)
+      cmd_deploy_slug "$@"
       ;;
     help|--help|-h)
       usage

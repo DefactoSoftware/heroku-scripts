@@ -10,6 +10,7 @@ Replaces the older Elixir version of this tool.
 - macOS or Linux
 - `bash` (any version that ships with the OS is fine)
 - The `heroku` CLI, installed and authenticated (`heroku login`)
+- [`jq`](https://jqlang.org) — only needed for the `deploy-slug` command
 
 ## Install
 
@@ -71,6 +72,7 @@ heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency
 heroku-scripts config-replace <pipeline> <stage> <VAR> <old-value> <new-value> [--concurrency=N] [--dry-run] [-a|--all] [--table|--csv] [--no-stream]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
+heroku-scripts deploy-slug <target-app> [--from=<source-app>] [--dry-run] [--yes]
 ```
 
 Run `heroku-scripts help` for the full command list.
@@ -195,6 +197,39 @@ heroku-scripts promote my-app my-team my-pipe
 `promote` runs destructive, largely irreversible operations, so it prints what
 it will do and asks for confirmation first. Pass `--dry-run` to preview the
 exact `heroku` commands, or `--yes` to skip the prompt.
+
+### Deploy an already-built slug to another app
+
+`deploy-slug` releases an existing slug to an app — a deploy without a build,
+the same mechanism the [detroit CI slug
+pipeline](https://github.com/DefactoSoftware/detroit/blob/master/.github/workflows/release-heroku-slug-pipeline.yml)
+uses. It looks up the slug the source app is *currently running* (config-var
+changes and rollbacks reuse their code's slug, so this is the newest
+slug-carrying release, not just the last code deploy) and creates a release
+with it on the target app:
+
+```sh
+heroku-scripts deploy-slug detroit-new-customer --from=detroit-production
+```
+
+Without `--from`, it scans every `detroit-*` app your credential can see and
+picks the most recently **built** slug among the ones currently running:
+
+```sh
+heroku-scripts deploy-slug detroit-new-customer
+```
+
+Ranking is by slug build time, not release time, on purpose: some detroit
+apps opt out of auto deploys, so a plain `config:set` on a stale app creates
+a newer *release* of older *code* — a latest-release comparison would pick
+the wrong slug.
+
+Before releasing anything it prints the slug, its commit, where it came from,
+and what the target currently runs (including a warning when the target
+already runs that exact slug — releasing it again only restarts dynos), then
+asks for confirmation. Pass `--dry-run` to preview the API call without
+running it, or `--yes` to skip the prompt. This command needs `jq`, and both
+lookups and the release go through your normal heroku CLI credentials.
 
 ## Development
 
