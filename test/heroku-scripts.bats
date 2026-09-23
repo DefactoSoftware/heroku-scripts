@@ -692,3 +692,306 @@ STUB
   [ "$status" -eq 1 ]
   [[ "$output" == *"1Password CLI"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# pipeline-sql
+# ---------------------------------------------------------------------------
+
+# heroku stub for pipeline-sql. pipelines:info lists several stages so a test
+# picks its app mix by stage name. pg:psql insists on the exact call shape
+# (`pg:psql -f <file> -a <app>`), logs its argv to ./psql-calls, copies the
+# script it was handed to ./psql-file-<app> (so tests can assert on the file
+# contents), and prints the sentinel by reading it out of the script's `\echo`
+# line — so tests never hardcode it. Streams are split like the real CLI's:
+# the query result (and psqlrc chatter) on stdout; the update banner, the
+# "--> Connecting to ..." line, psql's NOTICE/ERROR lines and heroku's own
+# errors on stderr.
+_heroku_stub_pg_psql() {
+  cat > "$TESTDIR/bin/heroku" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$1" == "pipelines:info" ]]; then
+  printf '=== %s\n' "$2"
+  printf 'app-two        basic\napp-one        basic\n'
+  printf 'app-one        mixed\napp-empty        mixed\napp-err        mixed\n'
+  printf 'app-noisy        noise\n'
+  printf 'app-one        drift\napp-drift        drift\n'
+  printf 'app-nodb        nodb\n'
+  printf 'app-notice        notice\n'
+  printf 'app-banner        banner\n'
+  printf 'app-nullrow        nullrow\n'
+  printf 'app-empty        empties\napp-empty2        empties\n'
+  exit 0
+fi
+if [[ "$1" != "pg:psql" || "$2" != "-f" || "$4" != "-a" || $# -ne 5 ]]; then
+  echo "unexpected call: $*" >&2
+  exit 1
+fi
+file="$3"; app="$5"
+# Build the whole log line first and append it with ONE write: apps run in
+# parallel, and several small writes per app can interleave in the file.
+line='PSQL'; for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> ./psql-calls
+cp "$file" "./psql-file-$app"
+sentinel="$(sed -n 's/^\\echo //p' "$file")"
+echo " ›   Warning: heroku update available from 8.0.0 to 9.0.0." >&2
+echo "--> Connecting to postgresql-curved-12345" >&2
+case "$app" in
+  app-one)    printf '%s\nid\tname\n1\talice\n2\tbob\n' "$sentinel";;
+  app-two)    printf '%s\nid\tname\n3\tcarol\n' "$sentinel";;
+  app-empty)  printf '%s\nid\tname\n' "$sentinel";;
+  app-empty2) printf '%s\nid\tname\n' "$sentinel";;
+  # psqlrc chatter lands on stdout BEFORE the sentinel.
+  app-noisy)  printf 'Timing is on.\nNull display is "(null)".\n%s\nid\tname\n7\tzed\n' "$sentinel";;
+  app-drift)  printf '%s\nid\temail\n9\tx@y.z\n' "$sentinel";;
+  # A successful query that also raised a NOTICE (on stderr).
+  app-notice)
+    echo "psql:$file:15: NOTICE:  identifier will be truncated" >&2
+    printf '%s\nid\tname\n5\teve\n' "$sentinel";;
+  # A data value that looks exactly like heroku's connecting banner.
+  app-banner) printf '%s\nid\tnote\n6\t--> Connecting to postgresql-curved-12345\n' "$sentinel";;
+  # `select null as x`: a header and one row whose only cell is empty.
+  app-nullrow) printf '%s\nx\n\n' "$sentinel";;
+  # A SQL error: psql prefixes the first line with the -f file and line
+  # number, then heroku adds its own exit trailer — all on stderr.
+  app-err)
+    printf '%s\n' "$sentinel"
+    printf 'psql:%s:14: ERROR:  relation "users" does not exist\nLINE 1: select * from users\n                      ^\n ›   Error: psql exited with code 3\n' "$file" >&2
+    exit 1;;
+  # heroku fails before psql ever runs: no sentinel at all.
+  app-nodb)   echo " ›   Error: No database found for app-nodb" >&2; exit 1;;
+esac
+STUB
+  chmod +x "$TESTDIR/bin/heroku"
+}
+
+@test "pipeline-sql merges every app's rows under one header, sorted by app" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe basic "select id, name from users"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;id;name" ]
+  [ "${lines[1]}" = "app-one;1;alice" ]
+  [ "${lines[2]}" = "app-one;2;bob" ]
+  [ "${lines[3]}" = "app-two;3;carol" ]
+  [ "${#lines[@]}" -eq 4 ]
+  [ -z "$stderr" ]
+}
+
+@test "pipeline-sql calls pg:psql -f <file> -a <app> once per app" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic "select 1"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < psql-calls | tr -d ' ')" = "2" ]
+  grep -qE '^PSQL \[pg:psql\] \[-f\] \[[^]]+/\.[^]/]+\] \[-a\] \[app-one\]$' psql-calls
+  grep -qE '^PSQL \[pg:psql\] \[-f\] \[[^]]+/\.[^]/]+\] \[-a\] \[app-two\]$' psql-calls
+}
+
+@test "pipeline-sql writes the inline SQL and the psql settings into the -f file" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic "select count(*) from users where name = 'o''brien'"
+  [ "$status" -eq 0 ]
+  grep -qxF "select count(*) from users where name = 'o''brien'" psql-file-app-one
+  grep -qxF '\set ON_ERROR_STOP on' psql-file-app-one
+  grep -qxF '\set QUIET on' psql-file-app-one
+  grep -qxF '\pset format unaligned' psql-file-app-one
+  grep -qxF "\\pset fieldsep '\\t'" psql-file-app-one
+  grep -qxF "\\pset null ''" psql-file-app-one
+  # The sentinel echo comes after every setting and before the SQL.
+  awk '/^\\echo / { echo = NR } /^select count/ { sql = NR } /^\\pset null/ { last = NR }
+       END { exit !(last < echo && echo < sql) }' psql-file-app-one
+  # Both apps got the identical script.
+  cmp -s psql-file-app-one psql-file-app-two
+}
+
+@test "pipeline-sql --file reads the SQL from a file" {
+  _heroku_stub_pg_psql
+  printf 'select id,\n       name\nfrom users\n' > query.sql
+  run "$SCRIPT" pipeline-sql mypipe basic --file=query.sql
+  [ "$status" -eq 0 ]
+  [ "${lines[1]}" = "app-one;1;alice" ]
+  grep -qxF 'select id,' psql-file-app-one
+  grep -qxF '       name' psql-file-app-one
+  grep -qxF 'from users' psql-file-app-one
+}
+
+@test "pipeline-sql --table renders one aligned table with error rows spanning the columns" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe mixed "select id, name from users" --table -a
+  [ "$status" -eq 0 ]
+  # Widths: app column 9 (app-empty), id 2, name 5 (alice).
+  [ "${lines[0]}" = "appname   | id | name" ]
+  [ "${lines[1]}" = "----------+----+------" ]
+  [ "${lines[2]}" = "app-empty |    |" ]
+  [ "${lines[3]}" = 'app-err   | ERROR:  relation "users" does not exist' ]
+  [ "${lines[4]}" = "          | LINE 1: select * from users" ]
+  [ "${lines[5]}" = "          |                       ^" ]
+  [ "${lines[6]}" = "app-one   | 1  | alice" ]
+  [ "${lines[7]}" = "app-one   | 2  | bob" ]
+  [ "${#lines[@]}" -eq 8 ]
+  # No trailing whitespace anywhere.
+  ! grep -q '[[:space:]]$' <<< "$output"
+}
+
+@test "pipeline-sql turns a failed query into an error record with the psql prefix and heroku trailer removed" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe mixed "select * from users" --csv
+  [ "$status" -eq 0 ]
+  [ "${lines[1]}" = 'app-err;ERROR:  relation "users" does not exist' ]
+  [ "${lines[2]}" = "LINE 1: select * from users" ]
+  [ "${lines[3]}" = "                      ^" ]
+  [[ "$output" != *"psql:"* ]]
+  [[ "$output" != *"psql exited"* ]]
+  # The error did not stop the other apps from being reported.
+  [[ "$output" == *"app-one;1;alice"* ]]
+}
+
+@test "pipeline-sql reports heroku failing before psql ran (no sentinel) as an error record" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe nodb "select 1" --csv
+  [ "$status" -eq 0 ]
+  # No app produced a header, so the fallback header is used.
+  [ "${lines[0]}" = "appname;output" ]
+  [ "${lines[1]}" = "app-nodb;Error: No database found for app-nodb" ]
+  [[ "$output" != *"Connecting to"* ]]
+  [[ "$output" != *"update available"* ]]
+}
+
+@test "pipeline-sql skips apps with no rows and reports a count on stderr" {
+  _heroku_stub_pg_psql
+  "$SCRIPT" pipeline-sql mypipe mixed "select id, name from users" --csv >stdout.txt 2>stderr.txt
+  ! grep -q "app-empty" stdout.txt
+  grep -q "app-one;1;alice" stdout.txt
+  # A blank line separates the output from the summary; no ANSI styling when
+  # stderr is not a terminal.
+  [ -z "$(head -n 1 stderr.txt)" ]
+  grep -q "1 app(s) with no rows skipped" stderr.txt
+  grep -q -- "-a/--all" stderr.txt
+  ! grep -qF $'\033' stderr.txt
+}
+
+@test "pipeline-sql -a includes a no-rows app as one empty row and prints no skip summary" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe mixed "select id, name from users" --csv -a
+  [ "$status" -eq 0 ]
+  [ "${lines[1]}" = "app-empty;;" ]
+  [[ "$stderr" != *"skipped"* ]]
+}
+
+@test "pipeline-sql discards psqlrc output printed before the sentinel" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe noise "select id, name from users"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;id;name" ]
+  [ "${lines[1]}" = "app-noisy;7;zed" ]
+  [ "${#lines[@]}" -eq 2 ]
+  [[ "$output" != *"Timing"* ]]
+  [[ "$output" != *"Null display"* ]]
+}
+
+@test "pipeline-sql warns on stderr when an app's columns differ but still emits its rows" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe drift "select id, name from users"
+  [ "$status" -eq 0 ]
+  # app-drift sorts first, so its header wins.
+  [ "${lines[0]}" = "appname;id;email" ]
+  [ "${lines[1]}" = "app-drift;9;x@y.z" ]
+  [ "${lines[2]}" = "app-one;1;alice" ]
+  [ "${lines[3]}" = "app-one;2;bob" ]
+  [ "$stderr" = "pipeline-sql: app-one: columns differ from app-drift (id, name vs id, email)" ]
+}
+
+@test "pipeline-sql accepts SQL that starts with a -- comment after an end-of-options --" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic --csv -- $'-- who is there\nselect 1'
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;id;name" ]
+  [[ "$output" == *"app-one;1;alice"* ]]
+  # The comment line and the statement both reach the psql script.
+  grep -qx -- '-- who is there' psql-file-app-one
+  grep -qx 'select 1' psql-file-app-one
+}
+
+@test "pipeline-sql requires the SQL, inline or via --file" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"No SQL given"* ]]
+  [[ "$output" == *"Usage:"* ]]
+  [ ! -e psql-calls ]
+}
+
+@test "pipeline-sql rejects inline SQL combined with --file" {
+  _heroku_stub_pg_psql
+  printf 'select 1\n' > query.sql
+  run "$SCRIPT" pipeline-sql mypipe basic "select 1" --file=query.sql
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not both"* ]]
+  [[ "$output" == *"Usage:"* ]]
+  [ ! -e psql-calls ]
+}
+
+@test "pipeline-sql fails clearly on an unreadable --file" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic --file=does-not-exist.sql
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Cannot read SQL file: does-not-exist.sql"* ]]
+  [ ! -e psql-calls ]
+}
+
+@test "pipeline-sql rejects an unknown option" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic "select 1" --no-stream
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Unknown option: --no-stream"* ]]
+  [ ! -e psql-calls ]
+}
+
+@test "pipeline-sql rejects a non-positive concurrency" {
+  _heroku_stub_pg_psql
+  run "$SCRIPT" pipeline-sql mypipe basic "select 1" --concurrency=0
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"positive integer"* ]]
+}
+
+@test "pipeline-sql forwards a NOTICE on stderr with the app name instead of treating it as data" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe notice "select id, name from users"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;id;name" ]
+  [ "${lines[1]}" = "app-notice;5;eve" ]
+  [ "${#lines[@]}" -eq 2 ]
+  [ "$stderr" = "pipeline-sql: app-notice: NOTICE:  identifier will be truncated" ]
+}
+
+@test "pipeline-sql keeps a result value that looks like heroku's connecting banner" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe banner "select id, note from notes"
+  [ "$status" -eq 0 ]
+  [ "${lines[1]}" = "app-banner;6;--> Connecting to postgresql-curved-12345" ]
+  [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "pipeline-sql keeps a trailing row whose only cell is empty" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe nullrow "select null as x"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "appname;x" ]
+  [ "${lines[1]}" = "app-nullrow;" ]
+  [ "${#lines[@]}" -eq 2 ]
+  # It is a real row, not a "no rows" app.
+  [[ "$stderr" != *"skipped"* ]]
+}
+
+@test "pipeline-sql -a treats an empty-celled row as data, not as a no-rows placeholder" {
+  _heroku_stub_pg_psql
+  run --separate-stderr "$SCRIPT" pipeline-sql mypipe nullrow "select null as x" -a
+  [ "$status" -eq 0 ]
+  [ "${lines[1]}" = "app-nullrow;" ]
+  [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "pipeline-sql keeps the header when every app returns zero rows" {
+  _heroku_stub_pg_psql
+  "$SCRIPT" pipeline-sql mypipe empties "select id, name from users where false" --csv >stdout.txt 2>stderr.txt
+  [ "$(cat stdout.txt)" = "appname;id;name" ]
+  grep -q "2 app(s) with no rows skipped" stderr.txt
+}

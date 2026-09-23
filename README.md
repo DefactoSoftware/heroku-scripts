@@ -70,6 +70,7 @@ HEROKU_API_KEY="op://Private/Heroku/credential" op run -- heroku-scripts apps my
 heroku-scripts apps <pipeline> <stage>
 heroku-scripts pipeline-cmd <pipeline> <stage> "<heroku command>" [--concurrency=N] [--retries=N] [--no-stream] [-a] [--table|--csv]
 heroku-scripts config-replace <pipeline> <stage> <VAR> <old-value> <new-value> [--concurrency=N] [--dry-run] [-a|--all] [--table|--csv] [--no-stream]
+heroku-scripts pipeline-sql <pipeline> <stage> ("<sql>" | --file=<path>) [--concurrency=N] [-a|--all] [--table|--csv]
 heroku-scripts pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
 heroku-scripts promote <app> <to-team> <pipeline> [--dry-run] [--yes]
 heroku-scripts deploy-slug <target-app> [--from=<source-app>] [--dry-run] [--yes]
@@ -148,6 +149,108 @@ last error as its record. The default is `--retries=0` (unchanged behavior).
 
 One caveat: a mid-session drop can happen *after* the remote command started
 running, so only use `--retries` with commands that are safe to run twice.
+
+### Run one SQL query across a stage, as one merged table
+
+Running SQL through `pipeline-cmd` works — `pipeline-cmd my-pipe production
+'pg:psql -c "select count(*) from users"'` — but reads badly: each app's
+output is psql's own aligned table (header, dashes, rows, `(N rows)` footer),
+and that multi-line blob gets squeezed into pipeline-cmd's `appname | output`
+layout. `pipeline-sql` runs a single query against the default database
+(`DATABASE_URL`) of every app in the stage and prints ONE table with the app
+name as the first column:
+
+```sh
+heroku-scripts pipeline-sql my-pipe production "select count(*) as users, max(inserted_at) as newest from users"
+```
+
+```
+# on a terminal
+appname       | users | newest
+--------------+-------+--------------------------
+my-app        | 1204  | 2026-09-22 14:03:11.51239
+my-app-worker | 1204  | 2026-09-22 14:03:11.51239
+my-other-app  | 87    | 2026-09-19 09:12:40.00417
+
+# piped
+appname;users;newest
+my-app;1204;2026-09-22 14:03:11.51239
+my-app-worker;1204;2026-09-22 14:03:11.51239
+my-other-app;87;2026-09-19 09:12:40.00417
+```
+
+As with `pipeline-cmd`, the format is a table on a terminal and CSV when
+piped; force either with `--table` or `--csv`. Longer queries can come from a
+file instead of the command line:
+
+```sh
+heroku-scripts pipeline-sql my-pipe production --file=reports/orphaned-invoices.sql
+```
+
+Inline SQL that starts with a `-- comment` line would be mistaken for an
+option; put `--` (end of options) in front of it:
+
+```sh
+heroku-scripts pipeline-sql my-pipe production -- "-- locked accounts
+select id, email from users where locked"
+```
+
+Either way the SQL is expected to be **one statement that returns a result
+set**. Statements that return nothing (an `UPDATE`, a `DO` block) are
+reported as an error row rather than silently succeeding, and several
+statements in one file are not supported.
+
+The output is **buffered, not streamed**: the merged header and every column
+width depend on all apps' results, so nothing is printed until the last app
+finishes, and the rows come out sorted by app name. There are no
+`--stream`/`--no-stream` flags. `--concurrency=N` works as in `pipeline-cmd`.
+
+Apps whose query returns **no rows** are skipped, with a count on stderr; pass
+`-a`/`--all` to give each of them one row with empty cells instead:
+
+```sh
+heroku-scripts pipeline-sql my-pipe production "select id, email from users where locked" -a
+# appname;id;email
+# my-app;42;someone@example.com
+# my-app-worker;;
+```
+
+Apps whose query **fails** — a SQL error, or heroku itself failing (no
+database attached, no access) — get an error row in place of data, spanning
+the data columns, with psql's `psql:<file>:<line>:` prefix and heroku's
+`Error: psql exited with code N` trailer removed so only the message remains.
+The other apps are unaffected:
+
+```
+appname   | id | name
+----------+----+------
+app-one   | 1  | alice
+app-one   | 2  | bob
+app-three | ERROR:  relation "users" does not exist
+          | LINE 1: select * from users
+          |                       ^
+```
+
+The merged header is the first app's (in name order). If a later app returns
+different columns — schema drift between apps — its rows are still printed,
+but a warning like `pipeline-sql: app-two: columns differ from app-one (id,
+mail vs id, email)` goes to stderr, since its cells will sit under the wrong
+column names.
+
+Only the query result goes into the table. Anything psql says on the side
+during a *successful* query — a `NOTICE` from a `RAISE NOTICE`, a `WARNING`,
+an identifier-truncation notice — is forwarded to stderr, one line each,
+prefixed with the app name (`pipeline-sql: my-app: NOTICE:  ...`), so it is
+neither lost nor mistaken for data.
+
+Two caveats. Cells are tab-separated internally and rows newline-separated,
+so a value that itself contains a tab or newline will break its row — like
+`pipeline-cmd`'s CSV, this output is for reading and grepping, not strict
+parsing. And because `heroku pg:psql` offers no way to pass psql's `-X`/`-q`
+flags, your `~/.psqlrc` is still read: pipeline-sql neutralises its output
+and formatting settings (`\timing`, `\pset` changes, `\o` redirection,
+`\echo` chatter) from inside the query script, but a psqlrc that errors out
+or changes `\set ON_ERROR_STOP` semantics will still get in the way.
 
 ### Replace a config var's value across a stage, only where it currently matches
 

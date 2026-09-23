@@ -51,6 +51,24 @@ Commands:
       the same empty line for an unset var and one set to the empty string,
       so a var set to "" is treated as not set.
 
+  pipeline-sql <pipeline> <stage> ("<sql>" | --file=<path>) [--concurrency=N] [-a|--all] [--table|--csv]
+      Run one SQL statement against the default database (DATABASE_URL) of
+      every app in <pipeline>/<stage> via \`pg:psql\`, and print the results
+      as ONE merged table with the app name as the first column — where
+      pipeline-cmd would show each app's own psql table. The SQL, inline or
+      from --file, must be a single statement that returns a result set.
+      Output is always buffered and sorted by app name (the merged header
+      and column widths depend on every app's result), so there are no
+      streaming flags. Apps whose query returns no rows are skipped (a
+      count is reported on stderr); -a/--all gives them one empty row. An
+      app whose query fails gets its error message in place of rows.
+
+      Table on a terminal, CSV (\`appname;col1;col2\`) when piped; force
+      either with --table or --csv. Cells are tab-separated internally, so
+      values containing tabs or newlines will break rows: the output is
+      for reading/grepping, not strict parsing. Your ~/.psqlrc is still
+      read, but its output and formatting settings are neutralised.
+
   pipeline-task <pipeline> <stage> <MixTask> [--concurrency=N]
       Run \`mix <MixTask>\` via \`heroku run\` against every app in
       <pipeline>/<stage>. Defaults to 3 concurrent runs.
@@ -307,53 +325,75 @@ emit_record() {
   done <<< "$output"
 }
 
-# Shared skeleton for the commands that fan a per-app worker out across a
-# pipeline stage: chunked parallelism, streaming or buffered record emission,
-# table/CSV rendering, and the skipped-apps summary. pipeline-cmd and
-# config-replace differ only in what they do per app, so that part comes in as
-# a worker function name. Worker-specific parameters (the heroku command, the
-# config var, ...) are the calling command's locals, which bash's dynamic
-# scoping keeps visible inside the worker.
+# Resolves a command's output format — `auto` becomes a table on a terminal
+# and CSV when piped or redirected; --table/--csv pass through untouched — and
+# stores it in the variable named by $1 (printf -v, as in make_run_tmpdir).
 #
-# The worker is called with one argument (the app name), prints the app's
-# record on stdout, and returns non-zero to skip the app: no record is emitted
-# and the app is counted in the stderr summary, rendered as
-# "<count> $skip_summary".
-run_pipeline_workers() {
-  local worker="$1" apps="$2" concurrency="$3" stream="$4" format="$5" skip_summary="$6"
-
-  # Resolve auto -> table on a terminal, CSV when piped. The table's left column
-  # is sized from the (already known) app list, so table output still streams.
-  local render="$format"
-  if [[ "$render" == "auto" ]]; then
-    if [[ -t 1 ]]; then render=table; else render=csv; fi
+# It must NOT be called inside `$(...)`: a command substitution's stdout is
+# the capture pipe, so `[[ -t 1 ]]` would always be false and every auto run
+# would render CSV, even on a terminal. Hence the out-variable.
+resolve_render_format() {
+  local varname="$1" format="$2"
+  if [[ "$format" == "auto" ]]; then
+    if [[ -t 1 ]]; then format=table; else format=csv; fi
   fi
-  local width=7
-  [[ "$render" == "table" ]] && width="$(app_column_width "$apps")"
+  printf -v "$varname" '%s' "$format"
+}
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  # Interpolate $tmpdir into the trap *now*, not at fire time — by the time
-  # the EXIT trap runs, this function has returned and the local is gone.
+# Creates the scratch directory for one fan-out run and stores its path in the
+# variable named by $1 (printf -v, so no eval). Installs the cleanup traps too:
+# they are process-global, and the directory outlives this function because the
+# caller keeps reading per-app files out of it after the workers finish.
+#
+# Also creates `.skipped/`, where workers drop a marker file for each app they
+# skip so the parent can report a count once they all finish. A dotfile dir —
+# like everything else the runner itself puts in here — so the collection glob
+# (`$tmpdir/*`) only ever sees per-app files.
+make_run_tmpdir() {
+  # The local is deliberately NOT called tmpdir: callers pass that name, and
+  # a same-named local here would shadow theirs, leaving printf -v writing
+  # into our own variable and the caller's empty.
+  local varname="$1" dir
+  dir="$(mktemp -d)"
+  # Interpolate $dir into the trap *now*, not at fire time — by the time the
+  # EXIT trap runs, this function has returned and the local is gone.
   # shellcheck disable=SC2064
-  trap "rm -rf '$tmpdir'" EXIT
+  trap "rm -rf '$dir'" EXIT
   # On an external INT/TERM (cron, a wrapper script, plain `kill`, systemd
   # stop) the signal reaches only the parent. Without this, the backgrounded
   # heroku subshells are orphaned and keep running while the EXIT trap deletes
   # the tmpdir out from under them. Tear the jobs down first, then clean up.
   # shellcheck disable=SC2064
-  trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$tmpdir'; exit 130" INT TERM
+  trap "trap - INT TERM EXIT; kill \$(jobs -p) 2>/dev/null || true; rm -rf '$dir'; exit 130" INT TERM
+  mkdir "$dir/.skipped"
+  printf -v "$varname" '%s' "$dir"
+}
 
-  # Workers drop a marker file here for each app they skip, so the parent can
-  # report a count after they all finish. A dotfile dir, so the --no-stream
-  # collection glob (`$tmpdir/*`) never picks it up.
-  mkdir "$tmpdir/.skipped"
-
-  if [[ "$render" == "table" ]]; then
-    print_table_header "$width"
-  else
-    echo "appname;output"
-  fi
+# The chunked fan-out core shared by every command that runs a per-app worker
+# across a pipeline stage (pipeline-cmd, config-replace, pipeline-sql). It only
+# runs workers and files their results; what a record means and how it is
+# rendered is the caller's business, which is what lets pipeline-sql (one
+# merged table, rendered after everything is in) share it with pipeline-cmd
+# (one record per app, streamed) without either bending to the other.
+#
+# The worker is called with one argument (the app name) and prints the app's
+# record on stdout. Its exit status decides what happens to the record:
+#   0        stored at $tmpdir/<app> (the filename IS the app name, so the
+#            caller's `$tmpdir/*` glob yields records sorted by app), and —
+#            when $on_record is a non-empty function name — also handed to
+#            `$on_record <app> <record>` right away, serialized under a lock
+#            so concurrent finishers can't interleave their output.
+#   non-zero "skip this app": no record, a marker in $tmpdir/.skipped/ instead.
+# Worker-specific parameters (the heroku command, the config var, the SQL
+# file, ...) are the calling command's locals, which bash's dynamic scoping
+# keeps visible inside the worker.
+fan_out_workers() {
+  local worker="$1" apps="$2" concurrency="$3" tmpdir="$4" on_record="$5"
+  # An empty/missing tmpdir would send the workers' writes to /<app> and make
+  # the streaming lock (`mkdir "$tmpdir/.lock"`) fail forever — a silent hang,
+  # so check it up front.
+  [[ -n "$tmpdir" && -d "$tmpdir/.skipped" ]] \
+    || die "internal error: fan_out_workers needs a directory from make_run_tmpdir"
 
   # Process apps in chunks of $concurrency. Waiting for each chunk to drain
   # before starting the next caps resource use; running every app in parallel
@@ -374,7 +414,10 @@ run_pipeline_workers() {
       # killing the subshell before it can emit its record.
       set +e
       if output="$("$worker" "$app")"; then
-        if [[ "$stream" == "true" ]]; then
+        # Always file the record (the caller reads these back for buffered,
+        # sorted rendering); the write is trivially cheap even when streaming.
+        printf '%s' "$output" > "$tmpdir/$app"
+        if [[ -n "$on_record" ]]; then
           # Print as soon as this app finishes. Serialize with an atomic mkdir
           # lock so a record streams out in one piece (emit_record may write
           # several lines for multi-line/table output) even when apps finish at
@@ -384,12 +427,8 @@ run_pipeline_workers() {
           # breaks on the first failed write so the lock is released promptly.
           trap '' PIPE
           while ! mkdir "$tmpdir/.lock" 2>/dev/null; do sleep 0.05; done
-          emit_record "$render" "$width" "$app" "$output"
+          "$on_record" "$app" "$output"
           rmdir "$tmpdir/.lock"
-        else
-          # Buffered: store the raw output (filename is the app name) and
-          # format it sorted at the end.
-          printf '%s' "$output" > "$tmpdir/$app"
         fi
       else
         # Non-zero from the worker means "skip this app": record it for the
@@ -407,6 +446,55 @@ run_pipeline_workers() {
     fi
   done 3<<< "$apps"
   wait || true
+}
+
+# Reports how many apps the workers skipped, on stderr so it never pollutes
+# the data stream piped from stdout. Separated from the output by a blank
+# line and rendered dim + italic — but only when stderr is a terminal and
+# NO_COLOR is unset, so redirected/piped output stays plain text. Silent when
+# nothing was skipped.
+report_skipped() {
+  local tmpdir="$1" skip_summary="$2" skipped
+  skipped="$(find "$tmpdir/.skipped" -type f | wc -l | tr -d ' ')"
+  (( skipped > 0 )) || return 0
+  local msg="$skipped $skip_summary"
+  if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+    printf '\n\033[2;3m%s\033[0m\n' "$msg" >&2
+  else
+    printf '\n%s\n' "$msg" >&2
+  fi
+}
+
+# Shared skeleton for the commands that emit one record per app (pipeline-cmd,
+# config-replace): fan_out_workers plus streaming or buffered `appname |
+# output` rendering and the skipped-apps summary, rendered as
+# "<count> $skip_summary". The two commands differ only in what they do per
+# app, so that part comes in as a worker function name — see fan_out_workers
+# for the worker contract.
+run_pipeline_workers() {
+  local worker="$1" apps="$2" concurrency="$3" stream="$4" format="$5" skip_summary="$6"
+
+  # The table's left column is sized from the (already known) app list, which
+  # is what lets table output stream. $render and $width are read by
+  # stream_pipeline_record through dynamic scoping.
+  local render width=7
+  resolve_render_format render "$format"
+  [[ "$render" == "table" ]] && width="$(app_column_width "$apps")"
+
+  local tmpdir
+  make_run_tmpdir tmpdir
+
+  if [[ "$render" == "table" ]]; then
+    print_table_header "$width"
+  else
+    echo "appname;output"
+  fi
+
+  # Streaming hands each record to stream_pipeline_record the moment its app
+  # finishes; --no-stream passes no callback and renders from the files below.
+  local on_record=""
+  [[ "$stream" == "true" ]] && on_record=stream_pipeline_record
+  fan_out_workers "$worker" "$apps" "$concurrency" "$tmpdir" "$on_record"
 
   # Streaming mode already printed each record. For --no-stream, emit the
   # buffered per-app rows now, in a stable app-name order. Bash sorts glob
@@ -422,20 +510,13 @@ run_pipeline_workers() {
     done
   fi
 
-  # Report how many apps the workers skipped, on stderr so it never pollutes
-  # the data stream piped from stdout. Separated from the output by a blank
-  # line and rendered dim + italic — but only when stderr is a terminal and
-  # NO_COLOR is unset, so redirected/piped output stays plain text.
-  local skipped
-  skipped="$(find "$tmpdir/.skipped" -type f | wc -l | tr -d ' ')"
-  if (( skipped > 0 )); then
-    local msg="$skipped $skip_summary"
-    if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
-      printf '\n\033[2;3m%s\033[0m\n' "$msg" >&2
-    else
-      printf '\n%s\n' "$msg" >&2
-    fi
-  fi
+  report_skipped "$tmpdir" "$skip_summary"
+}
+
+# fan_out_workers callback for run_pipeline_workers' streaming mode. $render
+# and $width are run_pipeline_workers' locals (dynamic scoping).
+stream_pipeline_record() {
+  emit_record "$render" "$width" "$1" "$2"
 }
 
 # Per-app worker for pipeline-cmd: run the heroku command and use its combined
@@ -583,6 +664,359 @@ cmd_config_replace() {
 
   run_pipeline_workers config_replace_worker "$apps" "$concurrency" "$stream" "$format" \
     "app(s) without $var skipped (use -a/--all to include them)"
+}
+
+# Marks where a pipeline-sql query's real output begins. The user's ~/.psqlrc
+# runs before our script and may print to stdout (e.g. "Timing is on.")
+# before our `\set QUIET on` can silence anything, so the script ends its
+# setup with `\echo <sentinel>` and the worker discards everything up to and
+# including that line. Fixed, printable, and unlikely to appear in a result.
+PIPELINE_SQL_SENTINEL='--- heroku-scripts pipeline-sql ---'
+
+# Prints the psql script pipeline-sql hands to every app: formatting
+# meta-commands, the sentinel, then the user's SQL verbatim.
+#
+# heroku's pg:psql accepts only -c or -f — no way to pass psql's own -X/-q/-A
+# flags — so all formatting has to happen through meta-commands inside the
+# file, and -c can't mix meta-commands with SQL, hence -f. Line by line:
+#   QUIET on        no "Output format is unaligned." style confirmations for
+#                   the \pset calls that follow
+#   ON_ERROR_STOP   a SQL error makes psql exit non-zero, which heroku turns
+#                   into a non-zero exit of its own ("psql exited with code N")
+#                   — that is how the worker tells an error from a result
+#   ECHO none       don't echo the query back
+#   \timing off     undo a ~/.psqlrc `\timing`, or every app appends "Time: …"
+#   unaligned, tab fieldsep, newline recordsep
+#                   one header line + one line per row, tab-separated, so the
+#                   renderer can merge results without parsing psql's ASCII art
+#   tuples_only off keep the header line: it names the merged table's columns
+#   footer off      no "(N rows)" trailer
+#   expanded off, \pset title (unset)
+#                   undo psqlrc settings that would change the line layout
+#   null ''         NULLs print as empty cells
+#   \o              (bare) send query output back to stdout, undoing a
+#                   psqlrc `\o somefile` that would swallow the result
+write_pipeline_sql_script() {
+  local sql="$1"
+  cat <<'EOF'
+\set QUIET on
+\set ON_ERROR_STOP on
+\set ECHO none
+\timing off
+\o
+\pset format unaligned
+\pset fieldsep '\t'
+\pset recordsep '\n'
+\pset tuples_only off
+\pset footer off
+\pset expanded off
+\pset title
+\pset null ''
+EOF
+  printf '\\echo %s\n' "$PIPELINE_SQL_SENTINEL"
+  printf '%s\n' "$sql"
+}
+
+# Per-app worker for pipeline-sql: runs the shared psql script against the
+# app's default database and prints the app's result as tagged lines, one
+# per line (the tag and payload are tab-separated):
+#   H<TAB><header>   the tab-separated column names (always first, at most one)
+#   R<TAB><row>      one tab-separated data row
+#   E<TAB><line>     one line of an error message (record has only E lines)
+# A per-line tag rather than a one-line-marker-then-payload layout because
+# the runner captures the record with `$(...)`, which strips trailing
+# newlines: a last row whose only cell is empty (`select null`) would vanish
+# untagged, whereas "R<TAB>" survives.
+#
+# Always returns 0 and always emits the H line when the query ran: the
+# "no rows" skip is decided in cmd_pipeline_sql's merge loop, because even a
+# zero-row app's header is needed to name (or drift-check) the merged
+# table's columns. $sql_file and $raw_dir are cmd_pipeline_sql's locals.
+pipeline_sql_worker() {
+  local app="$1" status
+  local out="$raw_dir/$app.out" err="$raw_dir/$app.err"
+  # A real argv call — the file path and app are discrete values, not a shell
+  # command. Its output goes to files, not `$(...)`, and stdout and stderr go
+  # to SEPARATE files, for three reasons:
+  #   - `$(...)` strips trailing newlines, and a trailing empty row (`select
+  #     null as x` prints "x", then an empty line) would be lost before it
+  #     could be tagged. awk reading the file does see that final empty line.
+  #   - heroku's pg:psql pipes psql's stdout (the result, nothing else)
+  #     through its own stdout, while psql's NOTICE/WARNING/ERROR lines, the
+  #     "--> Connecting to ..." banner, and heroku's own errors all go to
+  #     stderr. Merged, a NOTICE raised by a successful query would land after
+  #     the sentinel and be taken for the header or a row.
+  #   - the result must never pass through strip_heroku_noise: a data value
+  #     that happens to look like the connecting banner would be deleted.
+  #     Only stderr is filtered.
+  # The exit status is what tells a SQL error apart from a result.
+  heroku pg:psql -f "$sql_file" -a "$app" > "$out" 2> "$err"
+  status=$?
+
+  local found=false
+  grep -qFx -e "$PIPELINE_SQL_SENTINEL" "$out" && found=true
+
+  if (( status != 0 )) || [[ "$found" != "true" ]]; then
+    # Error: a SQL error (non-zero, sentinel present) or heroku itself failing
+    # before psql ran (no database attached, no such app — usually non-zero,
+    # but the missing sentinel alone is proof that no result was produced).
+    # The message is stderr, minus heroku's ambient noise and minus what the
+    # operator doesn't need: the `psql:<tmpfile>:<line>: ` prefix psql puts
+    # on errors from -f files (the temp path means nothing to anyone),
+    # heroku's own "Error: psql exited with code N" trailer (the real
+    # `ERROR: ...` line above it is the message), and the ` ›   ` bullet the
+    # heroku CLI puts in front of its own messages. `LINE 1: ...` and the
+    # caret line stay.
+    local message
+    message="$(strip_heroku_noise < "$err" | awk '
+      /^[[:space:]]*(›[[:space:]]+)?Error: psql exited with code [0-9]+/ { next }
+      {
+        sub(/^psql:[^[:space:]]+:[0-9]+: /, "")
+        sub(/^[[:space:]]*›[[:space:]]+/, "")
+        print "E\t" $0
+      }
+    ')"
+    if [[ -z "$message" ]]; then
+      # Nothing usable on stderr (e.g. heroku killed mid-run): still say why
+      # there are no rows, rather than emitting an empty record.
+      message="$(printf 'E\tpg:psql exited with status %s and no error message' "$status")"
+    fi
+    printf '%s' "$message"
+    return 0
+  fi
+
+  # Success. psql may still have written NOTICE/WARNING lines to stderr (a
+  # RAISE NOTICE, an identifier-truncation notice): forward them to our own
+  # stderr, prefixed with the app, so they aren't silently dropped — they
+  # can't go in the table without being mistaken for data. The
+  # `psql:<tmpfile>:<line>: ` prefix goes for the same reason as on errors.
+  strip_heroku_noise < "$err" \
+    | awk -v app="$app" '
+      NF { sub(/^psql:[^[:space:]]+:[0-9]+: /, ""); print "pipeline-sql: " app ": " $0 }
+    ' >&2
+
+  # The header line and rows are whatever follows the sentinel on stdout.
+  local result
+  result="$(awk -v s="$PIPELINE_SQL_SENTINEL" '
+    seen { print (n++ ? "R" : "H") "\t" $0 }
+    $0 == s { seen = 1 }
+  ' "$out")"
+  if [[ -z "$result" ]]; then
+    # Nothing at all after the sentinel: the statement produced no result set
+    # (an UPDATE/INSERT, whose command tag QUIET suppresses, or a bare
+    # meta-command). Not "no rows" — there were no columns either — so report
+    # it rather than silently skipping the app.
+    printf 'E\tno result set (pipeline-sql expects one statement that returns rows)'
+    return 0
+  fi
+  printf '%s' "$result"
+}
+
+# Renders pipeline-sql's collected records — a TSV of
+# `<app><TAB><tag><TAB><payload>` lines in app order, see pipeline_sql_worker
+# for the tags — as one merged table (fmt=table) or CSV (fmt=csv).
+#
+# One awk program in two passes: the whole file is read into arrays first
+# because the merged header and every column width depend on every app's
+# result; nothing can be printed before the last record is in. Kept to POSIX
+# awk so it runs unchanged on macOS's BWK awk and Linux's gawk: widths go
+# through sprintf("%-" w "s") rather than the `*` width, and counters stand
+# in for length(array).
+#
+# The merged header is the first app's. A later app whose header differs
+# (schema drift) still gets its rows printed but is called out on stderr,
+# since its cells will sit under the wrong column names. With no header at
+# all (every app errored) the single data column is called "output".
+#
+# Table: everything left-aligned, cells joined by " | ", a "-+-" rule, no
+# right border and no padding on the last cell (so no trailing whitespace).
+# Error lines span the data columns after the app cell; continuation lines
+# get a blank app cell and count toward no width. An app with a header but
+# no rows still contributes its header (see pipeline_sql_worker) but gets a
+# row — one of empty cells — only when all=true (-a/--all).
+# CSV: `appname;col1;col2`, rows with tabs turned into `;`, error records as
+# `app;<first line>` plus the remaining lines verbatim (the same shape
+# emit_record gives multi-line output in csv mode).
+render_pipeline_sql() {
+  local fmt="$1" all="$2" records="$3"
+  awk -v fmt="$fmt" -v all="$all" '
+    function pad(s, n) { return sprintf("%-" n "s", s) }
+    function dashes(n, s) { s = sprintf("%-" n "s", ""); gsub(/ /, "-", s); return s }
+    function commas(s) { gsub(/\t/, ", ", s); return s }
+    function semis(s) { gsub(/\t/, ";", s); return s }
+    # One data row in the chosen format: cell[1..n] under maxcols columns.
+    function row(app, n,   line, i, c) {
+      if (fmt != "table") {
+        line = app
+        for (i = 1; i <= maxcols; i++) line = line ";" (i <= n ? cell[i] : "")
+        print line
+        return
+      }
+      line = pad(app, w0)
+      for (i = 1; i <= maxcols; i++) {
+        c = (i <= n ? cell[i] : "")
+        if (i < maxcols) line = line " | " pad(c, w[i])
+        else if (c != "") line = line " | " c
+        else line = line " |"
+      }
+      print line
+    }
+    BEGIN { FS = "\t"; w0 = 7; ncols = 0; maxcols = 0; nrec = 0 }   # 7 = len("appname")
+    {
+      app = $1; tag = $2
+      payload = substr($0, length(app) + length(tag) + 3)   # past "app\t" and "tag\t"
+      nrec++; rapp[nrec] = app; rtag[nrec] = tag; rpay[nrec] = payload
+      if (length(app) > w0) w0 = length(app)
+      if (tag == "H") {
+        if (ncols == 0) {
+          ncols = split(payload, col, "\t"); first_app = app; first_hdr = payload
+        } else if (payload != first_hdr) {
+          print "pipeline-sql: " app ": columns differ from " first_app \
+            " (" commas(payload) " vs " commas(first_hdr) ")" | "cat 1>&2"
+        }
+      } else if (tag == "R") {
+        rows[app]++
+        n = split(payload, cell, "\t")
+        if (n > maxcols) maxcols = n
+        for (i = 1; i <= n; i++) if (length(cell[i]) > w[i]) w[i] = length(cell[i])
+      }
+    }
+    END {
+      close("cat 1>&2")
+      if (ncols == 0) { ncols = 1; col[1] = "output" }
+      if (ncols > maxcols) maxcols = ncols
+      for (i = 1; i <= maxcols; i++) {
+        if (i > ncols) col[i] = ""
+        if (length(col[i]) > w[i]) w[i] = length(col[i])
+      }
+      # Header (and rule). The header is a row too, so reuse row() for it.
+      for (i = 1; i <= maxcols; i++) cell[i] = col[i]
+      row("appname", maxcols)
+      if (fmt == "table") {
+        line = dashes(w0)
+        for (i = 1; i <= maxcols; i++) line = line "-+-" dashes(w[i])
+        print line
+      }
+      for (r = 1; r <= nrec; r++) {
+        if (rtag[r] == "R") {
+          n = split(rpay[r], cell, "\t")
+          row(rapp[r], n)
+        } else if (rtag[r] == "H") {
+          # rows[app] is unset (compares equal to 0) for a no-rows app.
+          if (all == "true" && rows[rapp[r]] == 0) row(rapp[r], 0)
+        } else if (rtag[r] == "E") {
+          cont = (r > 1 && rtag[r - 1] == "E" && rapp[r - 1] == rapp[r])
+          if (fmt != "table") print (cont ? "" : rapp[r] ";") rpay[r]
+          else if (rpay[r] != "") print pad(cont ? "" : rapp[r], w0) " | " rpay[r]
+          else print pad(cont ? "" : rapp[r], w0) " |"
+        }
+      }
+    }
+  ' "$records"
+}
+
+cmd_pipeline_sql() {
+  local usage_line="Usage: $SCRIPT_NAME pipeline-sql <pipeline> <stage> (\"<sql>\" | --file=<path>) [--concurrency=N] [-a|--all] [--table|--csv]"
+  [[ $# -ge 2 ]] || die "$usage_line"
+  local pipeline="$1" stage="$2"
+  shift 2
+
+  # The SQL comes either inline as the one remaining positional or from
+  # --file; anything else starting with a dash that we don't know goes to
+  # parse_concurrency, which owns the "Unknown option" error. No streaming
+  # flags: the merged table's header and widths depend on every app's result,
+  # so output is always buffered and sorted by app.
+  local sql_file_arg="" include_empty=false format=auto
+  local -a opts=() positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file=*) sql_file_arg="${1#*=}";;
+      -a|--all) include_empty=true;;
+      --table) format=table;;
+      --csv) format=csv;;
+      # End of options: whatever follows is the SQL, even when it starts with
+      # a dash — a statement that opens with a `-- comment` line would
+      # otherwise be taken for an option and rejected.
+      --) shift; while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done; break;;
+      -*) opts+=("$1");;
+      *) positional+=("$1");;
+    esac
+    shift
+  done
+
+  if [[ ${#positional[@]} -gt 1 ]]; then
+    die "$usage_line"
+  fi
+  local sql=""
+  if [[ ${#positional[@]} -eq 1 && -n "$sql_file_arg" ]]; then
+    die "Give the SQL either inline or with --file, not both"$'\n'"$usage_line"
+  elif [[ ${#positional[@]} -eq 1 ]]; then
+    sql="${positional[0]}"
+  elif [[ -n "$sql_file_arg" ]]; then
+    [[ -f "$sql_file_arg" && -r "$sql_file_arg" ]] || die "Cannot read SQL file: $sql_file_arg"
+    # `cat <` rather than `cat file`: a file named `-something.sql` would
+    # otherwise be taken for an option.
+    sql="$(cat < "$sql_file_arg")"
+  else
+    die "No SQL given: pass it inline or with --file=<path>"$'\n'"$usage_line"
+  fi
+  [[ -n "${sql//[[:space:]]/}" ]] || die "The SQL is empty"
+
+  local concurrency=3
+  if [[ ${#opts[@]} -gt 0 ]]; then
+    concurrency="$(parse_concurrency "${opts[@]}")" || exit 1
+  fi
+
+  resolve_heroku_api_key
+
+  local apps
+  apps="$(require_apps "$pipeline" "$stage")" || exit 1
+
+  local render
+  resolve_render_format render "$format"
+
+  # The psql script is written once and shared read-only by every worker. It
+  # lives in the run's tmpdir (so the traps clean it up) as a dotfile, so the
+  # per-app collection glob below never mistakes it for a record. Workers
+  # also park heroku's raw stdout/stderr per app under `.raw/` (see
+  # pipeline_sql_worker for why files rather than `$(...)`). $sql_file and
+  # $raw_dir are read by pipeline_sql_worker through dynamic scoping.
+  local tmpdir sql_file raw_dir
+  make_run_tmpdir tmpdir
+  sql_file="$tmpdir/.query.sql"
+  write_pipeline_sql_script "$sql" > "$sql_file"
+  raw_dir="$tmpdir/.raw"
+  mkdir "$raw_dir"
+
+  # Buffered on purpose (no per-record callback): see render_pipeline_sql.
+  fan_out_workers pipeline_sql_worker "$apps" "$concurrency" "$tmpdir" ""
+
+  # Merge the per-app records into one TSV, prefixing each line with its app.
+  # The glob is sorted (see run_pipeline_workers), so the renderer sees apps
+  # in name order and the first header it meets is the first app's. awk
+  # rather than cat: the files have no trailing newline (printf '%s'), so cat
+  # would glue one app's last line to the next app's first.
+  #
+  # This is also where "no rows" is decided: an app whose query ran (it has
+  # a header) but returned no data row is counted as skipped unless -a/--all
+  # — but its header line is still fed to the renderer, so a zero-row app
+  # can name the merged table's columns and take part in the drift check
+  # like any other. The renderer prints an empty row for it only with -a.
+  local records="$tmpdir/.records" f app
+  : > "$records"
+  for f in "$tmpdir"/*; do
+    [[ -f "$f" ]] || continue
+    app="${f##*/}"
+    if [[ "$include_empty" != "true" ]] \
+      && grep -q $'^H\t' "$f" && ! grep -q $'^R\t' "$f"; then
+      : > "$tmpdir/.skipped/$app"
+    fi
+    awk -v app="$app" '{ print app "\t" $0 }' "$f" >> "$records"
+  done
+
+  render_pipeline_sql "$render" "$include_empty" "$records"
+
+  report_skipped "$tmpdir" "app(s) with no rows skipped (use -a/--all to include them)"
 }
 
 cmd_pipeline_task() {
@@ -1001,6 +1435,9 @@ main() {
       ;;
     config-replace)
       cmd_config_replace "$@"
+      ;;
+    pipeline-sql)
+      cmd_pipeline_sql "$@"
       ;;
     pipeline-task)
       cmd_pipeline_task "$@"
